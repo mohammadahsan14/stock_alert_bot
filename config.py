@@ -1,9 +1,15 @@
 # config.py
-SENDER_EMAIL = "mohammadtahsan95@gmail.com"
-APP_PASSWORD = "jiya esyq eowb wryt"
-RECEIVER_EMAIL = "mohammadtahsan95@gmail.com"
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+SENDER_EMAIL = os.getenv("SENDER_EMAIL")
+APP_PASSWORD = os.getenv("APP_PASSWORD")
+RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 TOP_N = 50
-NEWS_API_KEY = "d49d081e83844d1388a52bff554f6a19"
+
 
 # Colors
 RISK_COLORS = {"Low": "#d4edda", "Medium": "#fff3cd", "High": "#f8d7da"}
