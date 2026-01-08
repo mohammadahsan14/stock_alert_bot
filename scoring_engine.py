@@ -119,3 +119,24 @@ def get_predictive_score(symbol):
         return total, label
     except:
         return 0, "Red"
+
+def generate_reasoning(stock):
+    reasons = []
+
+    if stock.get("news_sentiment", 0) > 0:
+        reasons.append("Positive news sentiment")
+
+    if stock.get("momentum", 0) > 0:
+        reasons.append("Upward price momentum")
+
+    if stock.get("risk") == "Low":
+        reasons.append("Low risk profile")
+
+    score = stock.get("score", 0)
+    if score >= 50:
+        reasons.append("High confidence score")
+
+    if not reasons:
+        return "No strong positive indicators at this time"
+
+    return " | ".join(reasons)

@@ -2,7 +2,7 @@
 
 from top_movers import fetch_sp500_tickers, calculate_top_movers
 from market_direction import get_market_direction
-from scoring_engine import get_predictive_score
+from scoring_engine import get_predictive_score, generate_reasoning
 from news_fetcher import fetch_news_links
 from config import (
     SENDER_EMAIL, APP_PASSWORD, RECEIVER_EMAIL, TOP_N,
@@ -57,17 +57,20 @@ def main():
         elif change > 0.5:
             market_bias = "BULLISH"
 
+    # -----------------------------
     # Adjust for bearish market
+    # -----------------------------
     if not df.empty and market_bias == "BEARISH":
         df.loc[df.get("decision") == "✅ CAN CONSIDER BUY", "decision"] = "⚠️ NEUTRAL"
         df.loc[df.get("day_trade") == "✅ Preferable", "day_trade"] = "⚠️ Moderate"
 
+    # -----------------------------
     # Buyable or fallback watchlist
+    # -----------------------------
     buyable_df = df[df.get('decision', '').str.contains("CAN CONSIDER BUY")] if not df.empty else pd.DataFrame()
     target_df = buyable_df if not buyable_df.empty else df.sample(n=min(len(df), 10), random_state=42) if not df.empty else pd.DataFrame()
 
     if target_df.empty:
-        # Dummy fallback watchlist
         sample_stocks = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
         target_df = pd.DataFrame([{
             "symbol": s,
@@ -78,11 +81,15 @@ def main():
             "day_trade": "⚠️ Moderate"
         } for s in sample_stocks])
 
+    # -----------------------------
     # Sample 10–15 stocks
+    # -----------------------------
     n_stocks = min(len(target_df), 15)
     target_df = target_df.sample(n=n_stocks, random_state=42).reset_index(drop=True)
 
+    # -----------------------------
     # Assign timeframe & buy dates
+    # -----------------------------
     today = datetime.today()
     timeframes = [("Day", today + timedelta(days=1)),
                   ("Week", today + timedelta(days=7)),
@@ -91,9 +98,10 @@ def main():
     target_df['buy_date'] = [timeframes[i % 3][1].strftime("%Y-%m-%d") for i in range(len(target_df))]
 
     # -----------------------------
-    # Predictive score, expected price, reason
+    # Predictive score, expected price, reason, reasoning
     # -----------------------------
-    scores, score_labels, expected_prices, reasons = [], [], [], []
+    scores, score_labels, expected_prices, reasons, reasoning_list = [], [], [], [], []
+
     for _, row in target_df.iterrows():
         try:
             score_val, score_label = get_predictive_score(row['symbol'])
@@ -118,10 +126,21 @@ def main():
         reason_text += " ".join(news_links)
         reasons.append(reason_text)
 
+        # Generate reasoning
+        stock_dict = {
+            "symbol": row['symbol'],
+            "score": score_val,
+            "risk": row['risk'],
+            "news_sentiment": 1 if news_links[0] != "No news available" else 0,
+            "momentum": 1 if row['pct_change'] > 0 else 0
+        }
+        reasoning_list.append(generate_reasoning(stock_dict))
+
     target_df['score'] = scores
     target_df['score_label'] = score_labels
     target_df['expected_price'] = expected_prices
     target_df['reason'] = reasons
+    target_df['reasoning'] = reasoning_list
 
     # -----------------------------
     # Build HTML table
@@ -131,7 +150,7 @@ def main():
     <table style="border-collapse: collapse; font-family: Arial, sans-serif; width: 100%;">
     <tr style="background-color:#f2f2f2;">
     <th>Symbol</th><th>Price</th><th>Change %</th><th>Risk</th><th>Decision</th>
-    <th>Timeframe</th><th>Buy Date</th><th>Score</th><th>Expected Price</th><th>Reason</th>
+    <th>Timeframe</th><th>Buy Date</th><th>Score</th><th>Expected Price</th><th>Reason</th><th>Reasoning</th>
     </tr>
     """
     for i, row in target_df.iterrows():
@@ -152,6 +171,7 @@ def main():
             <td style="background-color:{score_color}; text-align:center">{row['score_label']} ({row['score']})</td>
             <td>{row['expected_price']:.2f}</td>
             <td style="max-width:300px; word-wrap:break-word;">{row['reason']}</td>
+            <td style="max-width:300px; word-wrap:break-word;">{row['reasoning']}</td>
         </tr>
         """
     html += "</table>"
