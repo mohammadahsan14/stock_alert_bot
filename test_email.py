@@ -1,22 +1,24 @@
-# test_email.py
-from config import SENDER_EMAIL, APP_PASSWORD, RECEIVER_EMAIL
+import os
 import smtplib
 from email.message import EmailMessage
+import logging
 
-def send_test_email():
-    msg = EmailMessage()
-    msg["Subject"] = "✅ Test Email from Stock Alert Bot"
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = RECEIVER_EMAIL
-    msg.set_content("This is a test email to confirm your Railway deployment can send emails.")
+logging.basicConfig(level=logging.INFO)
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(SENDER_EMAIL, APP_PASSWORD)
-            smtp.send_message(msg)
-            print("✅ Test email sent successfully")
-    except Exception as e:
-        print("❌ Test email failed:", e)
+SENDER_EMAIL = os.getenv("SENDER_EMAIL")
+APP_PASSWORD = os.getenv("APP_PASSWORD")
+RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
 
-if __name__ == "__main__":
-    send_test_email()
+msg = EmailMessage()
+msg["Subject"] = "🚀 Test Email from Railway"
+msg["From"] = SENDER_EMAIL
+msg["To"] = RECEIVER_EMAIL
+msg.set_content("This is a test email from your Railway deployment.")
+
+try:
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(SENDER_EMAIL, APP_PASSWORD)
+        smtp.send_message(msg)
+        logging.info("✅ Test email sent successfully!")
+except Exception as e:
+    logging.error(f"❌ Test email failed: {e}")
