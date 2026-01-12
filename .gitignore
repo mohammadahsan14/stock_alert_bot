@@ -1,5 +1,18 @@
+# Secrets
 .env
+
+# Virtual environment
 .venv/
+
+# Python cache
 __pycache__/
-*.pyc.env
+*.pyc
+
+# Outputs / runtime
+outputs/
+*.xlsx
+*.csv
+*.log
+
+.DS_Store
 

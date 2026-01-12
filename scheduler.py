@@ -8,7 +8,7 @@ from datetime import datetime
 # Logging configuration
 # -----------------------------
 logging.basicConfig(
-    filename="stock_alert_log.txt",
+    filename="outputs/stock_alert_log.txt",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )

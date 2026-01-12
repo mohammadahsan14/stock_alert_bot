@@ -1,51 +1,106 @@
 # news_fetcher.py
-
 import requests
 import feedparser
+from datetime import datetime, timedelta
+from config import NEWS_API_KEY, FINNHUB_API_KEY
 
-# Example API Key, replace with your own in config.py if needed
-NEWS_API_KEY = "d49d081e83844d1388a52bff554f6a19"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0 Safari/537.36"
+)
 
+# -----------------------------
+# NewsAPI.org
+# -----------------------------
 def fetch_newsapi(symbol, max_articles=3):
-    """Fetch news from NewsAPI.org"""
+    if not NEWS_API_KEY:
+        return []
     try:
-        company_name_map = {
+        company_map = {
             "AAPL": "Apple",
             "MSFT": "Microsoft",
             "GOOGL": "Alphabet",
             "AMZN": "Amazon",
             "TSLA": "Tesla",
         }
-        query = company_name_map.get(symbol, symbol)
-        url = (f"https://newsapi.org/v2/everything?q={query}"
-               f"&sortBy=publishedAt&apiKey={NEWS_API_KEY}&pageSize={max_articles}")
-        r = requests.get(url, timeout=5).json()
-        news_items = []
-        for art in r.get("articles", [])[:max_articles]:
-            title = art.get("title", "No title")
-            link = art.get("url", "#")
-            news_items.append(f'✅ <a href="{link}" target="_blank">{title}</a>')
-        return news_items
+        query = company_map.get(symbol, symbol)
+        url = (
+            "https://newsapi.org/v2/everything"
+            f"?q={query}"
+            "&sortBy=publishedAt"
+            f"&apiKey={NEWS_API_KEY}"
+            f"&pageSize={max_articles}"
+            "&language=en"
+        )
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=8)
+        data = r.json()
+
+        items = []
+        for art in data.get("articles", [])[:max_articles]:
+            title = art.get("title") or "No title"
+            link = art.get("url") or "#"
+            items.append(f'✅ <a href="{link}" target="_blank">{title}</a>')
+        return items
     except Exception:
         return []
 
+# -----------------------------
+# Yahoo Finance RSS
+# -----------------------------
 def fetch_yahoo_rss(symbol, max_articles=3):
-    """Fetch news from Yahoo Finance RSS feed"""
     try:
         url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
         feed = feedparser.parse(url)
-        news_items = []
+        items = []
         for entry in feed.entries[:max_articles]:
-            news_items.append(f'✅ <a href="{entry.link}" target="_blank">{entry.title}</a>')
-        return news_items
+            title = getattr(entry, "title", "No title")
+            link = getattr(entry, "link", "#")
+            items.append(f'✅ <a href="{link}" target="_blank">{title}</a>')
+        return items
     except Exception:
         return []
 
+# -----------------------------
+# Finnhub.io (dynamic date range)
+# -----------------------------
+def fetch_finnhub(symbol, max_articles=3, lookback_days=7):
+    if not FINNHUB_API_KEY:
+        return []
+    try:
+        to_date = datetime.utcnow().date()
+        from_date = to_date - timedelta(days=lookback_days)
+
+        url = (
+            "https://finnhub.io/api/v1/company-news"
+            f"?symbol={symbol}"
+            f"&from={from_date.isoformat()}"
+            f"&to={to_date.isoformat()}"
+            f"&token={FINNHUB_API_KEY}"
+        )
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=8)
+        data = r.json() if r.status_code == 200 else []
+
+        items = []
+        for item in data[:max_articles]:
+            title = item.get("headline") or "No title"
+            link = item.get("url") or "#"
+            items.append(f'✅ <a href="{link}" target="_blank">{title}</a>')
+        return items
+    except Exception:
+        return []
+
+# -----------------------------
+# Unified news fetcher
+# Priority: NewsAPI -> Finnhub -> Yahoo
+# -----------------------------
 def fetch_news_links(symbol, max_articles=3):
-    """Combine multiple sources with fallback"""
-    news = fetch_newsapi(symbol, max_articles)
+    news = fetch_newsapi(symbol, max_articles=max_articles)
     if not news:
-        news = fetch_yahoo_rss(symbol, max_articles)
+        news = fetch_finnhub(symbol, max_articles=max_articles, lookback_days=7)
     if not news:
-        news = ["No news available"]
+        news = fetch_yahoo_rss(symbol, max_articles=max_articles)
+
+    if not news:
+        return ["No news available"]
     return news
