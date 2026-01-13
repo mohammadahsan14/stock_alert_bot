@@ -14,5 +14,9 @@ outputs/
 *.csv
 *.log
 
+# macOS
 .DS_Store
 
+# scheduler lock
+scheduler.lock
+outputs/scheduler.lock

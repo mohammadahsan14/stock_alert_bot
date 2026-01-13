@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import time
+import contextlib
+import io
 from io import StringIO
 from datetime import datetime, timedelta
 
@@ -89,6 +91,18 @@ def fetch_sp500_tickers() -> list[str]:
     return ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "TSLA"]
 
 
+@contextlib.contextmanager
+def _silence_yfinance_noise():
+    """
+    yfinance sometimes prints 'Failed download' messages directly to stdout/stderr.
+    This context manager silences that noise so your scheduler logs stay clean.
+    """
+    buf_out = io.StringIO()
+    buf_err = io.StringIO()
+    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+        yield
+
+
 def _get_ticker_df(download_df: pd.DataFrame, symbol: str, batch_len: int) -> pd.DataFrame:
     """
     yfinance can return:
@@ -96,7 +110,7 @@ def _get_ticker_df(download_df: pd.DataFrame, symbol: str, batch_len: int) -> pd
       - Multi ticker: columns can be MultiIndex or grouped by ticker.
     This helper returns a clean OHLCV df for a single symbol or empty df if missing.
     """
-    if download_df is None or download_df.empty:
+    if download_df is None or not isinstance(download_df, pd.DataFrame) or download_df.empty:
         return pd.DataFrame()
 
     # Single ticker request often returns a flat df
@@ -108,7 +122,7 @@ def _get_ticker_df(download_df: pd.DataFrame, symbol: str, batch_len: int) -> pd
         # try (symbol, field)
         try:
             part = download_df[symbol].copy()
-            if "Close" in part.columns:
+            if isinstance(part, pd.DataFrame) and "Close" in part.columns:
                 return part
         except Exception:
             pass
@@ -117,7 +131,7 @@ def _get_ticker_df(download_df: pd.DataFrame, symbol: str, batch_len: int) -> pd
         try:
             swapped = download_df.swaplevel(axis=1)
             part = swapped[symbol].copy()
-            if "Close" in part.columns:
+            if isinstance(part, pd.DataFrame) and "Close" in part.columns:
                 return part
         except Exception:
             pass
@@ -140,6 +154,54 @@ def _safe_last_close_series(ticker_df: pd.DataFrame) -> pd.Series:
     return s
 
 
+def _download_batch(batch: list[str], max_retries: int = 3) -> pd.DataFrame:
+    """
+    Attempt to download a batch. Returns DataFrame or empty DataFrame on failure.
+    """
+    attempt = 0
+    last_df = pd.DataFrame()
+
+    while attempt < max_retries:
+        try:
+            with _silence_yfinance_noise():
+                df = yf.download(
+                    tickers=batch,
+                    period="30d",
+                    group_by="ticker",
+                    progress=False,
+                    threads=False,      # keep stable; threads=True sometimes triggers weirdness
+                    auto_adjust=False,
+                )
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+            last_df = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        except Exception:
+            pass
+
+        attempt += 1
+        time.sleep(1.0)
+
+    return last_df if isinstance(last_df, pd.DataFrame) else pd.DataFrame()
+
+
+def _download_single(symbol: str) -> pd.DataFrame:
+    """
+    Safe single-ticker download fallback.
+    """
+    try:
+        with _silence_yfinance_noise():
+            df = yf.download(
+                tickers=symbol,
+                period="30d",
+                progress=False,
+                threads=False,
+                auto_adjust=False,
+            )
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
 def calculate_top_movers(tickers: list[str], top_n: int = TOP_N) -> list[dict]:
     """
     Computes movers using last two trading closes (not calendar days).
@@ -151,37 +213,23 @@ def calculate_top_movers(tickers: list[str], top_n: int = TOP_N) -> list[dict]:
 
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
-        attempt = 0
-        df = None
 
-        while attempt < max_retries:
-            try:
-                df = yf.download(
-                    batch,
-                    period="30d",
-                    group_by="ticker",
-                    progress=False,
-                    threads=True,
-                    auto_adjust=False,
-                )
-                break
-            except Exception as e:
-                attempt += 1
-                print(f"⚠️ Batch fetch failed (attempt {attempt}/{max_retries}): {e}")
-                time.sleep(1.0)
+        df = _download_batch(batch, max_retries=max_retries)
 
-        if df is None or df.empty:
-            print(f"❌ Skipping batch after {max_retries} failed attempts")
-            continue
+        # If batch is empty, fall back per ticker for this batch
+        use_single_fallback = (not isinstance(df, pd.DataFrame)) or df.empty
 
         for symbol in batch:
             try:
-                ticker_df = _get_ticker_df(df, symbol, batch_len=len(batch))
+                if use_single_fallback:
+                    ticker_df = _download_single(symbol)
+                else:
+                    ticker_df = _get_ticker_df(df, symbol, batch_len=len(batch))
+
                 close = _safe_last_close_series(ticker_df)
                 if close.empty or len(close) < 2:
                     continue
 
-                # last two trading closes
                 close_today = float(close.iloc[-1])
                 close_prev = float(close.iloc[-2])
                 if close_prev == 0:
@@ -203,7 +251,6 @@ def calculate_top_movers(tickers: list[str], top_n: int = TOP_N) -> list[dict]:
                 else:
                     pct_change_month = 0.0
 
-                # vol proxy
                 day_vol = abs(pct_change_day) / 100.0
                 week_vol = abs(pct_change_week) / 100.0
 
@@ -234,14 +281,11 @@ def calculate_top_movers(tickers: list[str], top_n: int = TOP_N) -> list[dict]:
                     "day_trade": day_trade,
                     "week_trade": week_trade,
                     "month_trade": month_trade,
-                    # Helpful debug fields (won't break your main.py)
-                    # "as_of_close": str(close.index[-1].date()) if hasattr(close.index[-1], "date") else "",
                 })
 
-            except Exception as e:
-                print(f"⚠️ Failed {symbol}: {e}")
+            except Exception:
+                # swallow per-symbol failures; keep bot running
                 continue
 
-    # Sort by absolute daily move
     all_movers.sort(key=lambda x: abs(x.get("pct_change", 0.0)), reverse=True)
     return all_movers[:top_n]
