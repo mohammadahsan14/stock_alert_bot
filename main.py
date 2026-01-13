@@ -56,6 +56,17 @@ def out_path(filename: str) -> str:
     """Return a safe file path inside outputs/."""
     return os.path.join(OUTPUT_DIR, filename)
 
+def log_outputs_folder():
+    try:
+        p = os.path.abspath(OUTPUT_DIR)
+        print(f"📁 outputs path: {p}")
+        if os.path.exists(p):
+            print("📄 outputs files:", os.listdir(p))
+        else:
+            print("⚠️ outputs folder not found")
+    except Exception as e:
+        print("⚠️ log_outputs_folder failed:", e)
+
 # Logs inside outputs/
 DAILY_LOG_CSV = out_path("daily_stock_log.csv")   # stores ONLY picks sent
 PERF_LOG_CSV = out_path("performance_log.csv")    # appended daily after post-market
