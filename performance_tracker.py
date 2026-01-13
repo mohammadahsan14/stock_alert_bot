@@ -114,7 +114,14 @@ def add_new_positions_from_picks(
         })
 
     added_df = pd.DataFrame(added_rows)
-    open_df = pd.concat([open_df, added_df], ignore_index=True)
+    if open_df is None or open_df.empty:
+        open_df = added_df.copy()
+    else:
+        # keep consistent columns (in case)
+        for c in added_df.columns:
+            if c not in open_df.columns:
+                open_df[c] = None
+        open_df = pd.concat([open_df, added_df], ignore_index=True)
     return open_df, added_df
 
 
