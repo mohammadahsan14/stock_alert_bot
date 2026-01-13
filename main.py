@@ -439,32 +439,50 @@ def send_email(subject: str, html_body: str, attachment_path: str | None = None)
 # -----------------------------
 # Post-market evaluation (reads picks log)
 # -----------------------------
-def evaluate_post_market_from_log(log_csv: str) -> pd.DataFrame:
+def evaluate_post_market_from_log(log_csv: str, run_date: str) -> pd.DataFrame:
     try:
         df = pd.read_csv(log_csv)
     except Exception:
         return pd.DataFrame()
 
     if df.empty or "symbol" not in df.columns:
+        return pd.DataFrame()
+
+    # ✅ Evaluate only today's picks
+    if "run_date" in df.columns:
+        df["run_date"] = df["run_date"].astype(str)
+        df = df[df["run_date"] == str(run_date)].copy()
+
+    if df.empty:
         return df
+
+    # Ensure current numeric
+    df["current"] = pd.to_numeric(df.get("current", pd.Series([float("nan")] * len(df))), errors="coerce")
 
     close_prices = []
     for symbol in df["symbol"].tolist():
+        close = float("nan")
         try:
-            data = yf.Ticker(symbol).history(period="1d")
-            close = float(data["Close"].iloc[-1]) if not data.empty else float("nan")
+            # ✅ more reliable than period="1d" on some days
+            data = yf.Ticker(symbol).history(period="5d", interval="1d")
+            if not data.empty and "Close" in data.columns:
+                close = float(data["Close"].dropna().iloc[-1])
         except Exception:
-            close = float("nan")
+            pass
         close_prices.append(close)
 
     df["close_price"] = close_prices
-    df["current"] = pd.to_numeric(df.get("current", pd.Series([float("nan")] * len(df))), errors="coerce")
     df["actual_change_pct"] = (df["close_price"] - df["current"]) / df["current"] * 100
 
     outcomes = []
     for _, row in df.iterrows():
         predicted = row.get("decision", "Not Advisable")
-        actual = row.get("actual_change_pct", 0)
+        actual = row.get("actual_change_pct", float("nan"))
+
+        # If no close found, mark explicitly
+        if pd.isna(actual):
+            outcomes.append("⚠️ No close data")
+            continue
 
         if predicted in ["Strong Buy", "Moderate"] and actual > 0:
             outcomes.append("✅ Correct")
@@ -568,6 +586,38 @@ def build_weekly_dashboard_html(perf_csv: str, now: datetime) -> str:
     """
 
 # -----------------------------
+# Phase 2: Portfolio helpers (correct signatures)
+# -----------------------------
+def portfolio_add_from_picks(picks_df: pd.DataFrame, run_dt: datetime) -> str:
+    cfg = PortfolioConfig()
+    open_df = load_open_portfolio(cfg)
+
+    updated_open, added_df = add_new_positions_from_picks(cfg, open_df, picks_df, run_dt)
+    save_open_portfolio(cfg, updated_open)
+
+    if added_df is not None and not added_df.empty:
+        hist = added_df.copy()
+        hist["action"] = "OPEN"
+        append_trade_history(cfg, hist)
+
+    return f"Added {0 if added_df is None else len(added_df)} new positions. Open now: {len(updated_open)}"
+
+
+def portfolio_update_and_close(run_dt: datetime) -> Tuple[str, pd.DataFrame]:
+    cfg = PortfolioConfig()
+    open_df = load_open_portfolio(cfg)
+
+    remaining, closed_df = update_and_close_positions(cfg, open_df, run_dt)
+    save_open_portfolio(cfg, remaining)
+
+    if closed_df is not None and not closed_df.empty:
+        closed_hist = closed_df.copy()
+        closed_hist["action"] = "CLOSE"
+        append_trade_history(cfg, closed_hist)
+
+    summary = portfolio_summary(remaining, closed_df)
+    return summary, closed_df
+
 # PRE-MARKET
 # -----------------------------
 def run_premarket(now: datetime):
@@ -594,7 +644,6 @@ def run_premarket(now: datetime):
             raise RuntimeError("Missing 'current' price column from top_movers output.")
     df["current"] = pd.to_numeric(df["current"], errors="coerce")
 
-    # remove invalid price rows early
     df = df[df["current"].notna() & (df["current"] > 0)].copy()
     if df.empty:
         raise RuntimeError("All rows had invalid prices. Refusing to run.")
@@ -686,7 +735,6 @@ def run_premarket(now: datetime):
     df["trade_plan"] = trade_plans
     df["run_date"] = now.strftime("%Y-%m-%d")
 
-    # ✅ NO TRADE DAY check (improved)
     skip, reason = should_skip_day(df, market_trend, snapshot)
 
     df_support = df.sort_values(by=["confidence", "score"], ascending=False).head(
@@ -705,7 +753,14 @@ def run_premarket(now: datetime):
         ).copy()
 
     # ✅ store picks sent for post-market evaluation
-    daily_picks.to_csv(DAILY_LOG_CSV, index=False)
+    if not skip:
+        daily_picks.to_csv(DAILY_LOG_CSV, index=False)
+    else:
+        # Clear log on no-trade days to prevent bogus evaluation
+        try:
+            pd.DataFrame().to_csv(DAILY_LOG_CSV, index=False)
+        except Exception:
+            pass
 
     daily_cols = [
         "run_date", "symbol", "price_category",
@@ -742,7 +797,7 @@ def run_premarket(now: datetime):
     with pd.ExcelWriter(pre_excel, engine="openpyxl") as writer:
         daily_picks_out.to_excel(writer, sheet_name="DAILY_PICKS", index=False)
         supporting.to_excel(writer, sheet_name="SUPPORTING_DATA", index=False)
-        perf.to_excel(writer, sheet_name="MODEL_PERFORMANCE", index=False)
+        perf.to_excel(writer, sheet_name="RUN_METADATA", index=False)
 
     wb = load_workbook(pre_excel)
     for s in wb.sheetnames:
@@ -750,36 +805,12 @@ def run_premarket(now: datetime):
     wb.save(pre_excel)
     log_outputs_folder()
 
-    # ✅ Phase 2: Update portfolio + close positions + add today's picks (ONLY IF NOT SKIPPED)
-    # This ensures "no trade day" doesn't add new positions.
     psummary_text = ""
     if not skip:
         try:
-            cfg = PortfolioConfig()
-            open_df = load_open_portfolio(cfg)
-
-            # 1) Update/close existing
-            remaining_open, closed_today = update_and_close_positions(cfg, open_df, asof=now)
-
-            # 2) Save closed trades to history
-            if closed_today is not None and not closed_today.empty:
-                append_trade_history(cfg, closed_today)
-
-            # 3) Add today's picks into portfolio (respect max open slots)
-            remaining_open, added_today = add_new_positions_from_picks(
-                cfg=cfg,
-                open_df=remaining_open,
-                picks_df=daily_picks_out,
-                run_date=now,
-            )
-
-            # 4) Save updated open file
-            save_open_portfolio(cfg, remaining_open)
-
-            # 5) Summary for potential email footer
-            psummary_text = portfolio_summary(remaining_open, closed_today)
+            add_summary = portfolio_add_from_picks(daily_picks_out, now)
+            psummary_text = add_summary
         except Exception as e:
-            # If portfolio logic fails, don't break the daily email.
             psummary_text = f"Portfolio update failed: {e}"
 
     if skip:
@@ -865,20 +896,13 @@ def run_postmarket(now: datetime):
         print("⏳ Post-market skipped (too early).")
         return
 
-    # ✅ Phase 2: update/close open positions and keep summary for email
     psummary_text = ""
     try:
-        cfg = PortfolioConfig()
-        open_df = load_open_portfolio(cfg)
-        remaining_open, closed_today = update_and_close_positions(cfg, open_df, asof=now)
-        if closed_today is not None and not closed_today.empty:
-            append_trade_history(cfg, closed_today)
-        save_open_portfolio(cfg, remaining_open)
-        psummary_text = portfolio_summary(remaining_open, closed_today)
+        psummary_text, _closed = portfolio_update_and_close(now)
     except Exception as e:
         psummary_text = f"Portfolio update failed: {e}"
 
-    df = evaluate_post_market_from_log(DAILY_LOG_CSV)
+    df = evaluate_post_market_from_log(DAILY_LOG_CSV, now.strftime("%Y-%m-%d"))
     if df.empty:
         html = f"""
         <h2>📊 Post-Market Summary ({now.strftime('%Y-%m-%d')})</h2>
@@ -889,8 +913,9 @@ def run_postmarket(now: datetime):
         send_email(f"📊 Post-Market Summary ({now.strftime('%Y-%m-%d')})", html)
         return
 
-    correct = int((df["outcome"] == "✅ Correct").sum()) if "outcome" in df.columns else 0
-    total = len(df)
+    eval_df = df[df["outcome"].isin(["✅ Correct", "❌ Incorrect"])].copy()
+    correct = int((eval_df["outcome"] == "✅ Correct").sum()) if not eval_df.empty else 0
+    total = len(eval_df)
     rate = (correct / total * 100) if total else 0
 
     summary_html = f"""
@@ -900,6 +925,9 @@ def run_postmarket(now: datetime):
        <b>Incorrect:</b> {total - correct}<br>
        <b>Success Rate:</b> {rate:.2f}%</p>
     """
+    if (len(df) - len(eval_df)) > 0:
+        summary_html += f"<p><b>Note:</b> {len(df) - len(eval_df)} picks had missing close data.</p>"
+
     if psummary_text:
         summary_html += f"<h3>📁 Portfolio Summary</h3><pre>{_html.escape(psummary_text)}</pre>"
 
@@ -912,7 +940,6 @@ def run_postmarket(now: datetime):
 
     send_email(f"📊 Post-Market Stock Summary ({now.strftime('%Y-%m-%d')})", summary_html, attachment_path=post_excel)
 
-    # Append to perf log
     out = df.copy()
     if "run_date" not in out.columns:
         out["run_date"] = now.strftime("%Y-%m-%d")
@@ -944,7 +971,6 @@ def main():
     parser.add_argument("--mode", choices=["premarket", "midday", "postmarket"], default="premarket")
     args = parser.parse_args()
 
-    # ✅ always in Chicago TZ
     now = datetime.now(LOCAL_TZ)
 
     if args.mode == "premarket":
