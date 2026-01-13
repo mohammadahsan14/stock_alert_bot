@@ -748,6 +748,7 @@ def run_premarket(now: datetime):
     for s in wb.sheetnames:
         style_excel_sheet(wb[s])
     wb.save(pre_excel)
+    log_outputs_folder()
 
     # ✅ Phase 2: Update portfolio + close positions + add today's picks (ONLY IF NOT SKIPPED)
     # This ensures "no trade day" doesn't add new positions.
