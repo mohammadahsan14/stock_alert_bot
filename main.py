@@ -394,7 +394,8 @@ def build_email_html_top_picks(df: pd.DataFrame, run_date: str) -> str:
           <th style='padding:6px;border:1px solid #ddd;'>Score</th>
           <th style='padding:6px;border:1px solid #ddd;'>Conf</th>
           <th style='padding:6px;border:1px solid #ddd;'>News</th>
-          <th style='padding:6px;border:1px solid #ddd;'>Why</th>
+        <th style='padding:6px;border:1px solid #ddd;'>Main News</th>
+        <th style='padding:6px;border:1px solid #ddd;'>Why</th>
         </tr>
         """
         for _, row in cat_df.iterrows():
@@ -402,8 +403,12 @@ def build_email_html_top_picks(df: pd.DataFrame, run_date: str) -> str:
             score_color = SCORE_COLORS.get(label, "#FFFFFF")
 
             why = _html.escape(str(row.get("reasons", "") or ""))
+            link = str(row.get("main_news_link", "") or "")
+            title = _html.escape(str(row.get("main_news_title", "") or "—"))
+            main_news_html = f'<a href="{_html.escape(link)}" target="_blank">{title}</a>' if link else title
             if len(why) > 240:
                 why = why[:240] + "..."
+
 
             html += f"""
             <tr>
@@ -417,8 +422,8 @@ def build_email_html_top_picks(df: pd.DataFrame, run_date: str) -> str:
               <td style='padding:6px;border:1px solid #ddd;background:{score_color};text-align:center;'>{_html.escape(label)} ({int(row.get('score',0) or 0)})</td>
               <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{int(row.get('confidence',0) or 0)}</td>
               <td style='padding:6px;border:1px solid #ddd;text-align:center;font-size:16px;'>{_html.escape(str(row.get('news_flag','🟡') or '🟡'))}</td>
-              <td style='padding:6px;border:1px solid #ddd;'>{why}</td>
-            </tr>
+                <td style='padding:6px;border:1px solid #ddd;'>{main_news_html}</td>
+                <td style='padding:6px;border:1px solid #ddd;'>{why}</td>            </tr>
             """
         html += "</table>"
 
@@ -736,6 +741,19 @@ def run_premarket(now: datetime):
     df["run_date"] = now.strftime("%Y-%m-%d")
 
     skip, reason = should_skip_day(df, market_trend, snapshot)
+    print(f"🧠 SKIP? {skip} | Reason: {reason}")
+    print(
+        f"📉 Market trend={market_trend} | SPY gap={float(snapshot.get('spy_gap_pct') or 0.0):.2f}% | VIX={snapshot.get('vix')}")
+    if "pct_change" in df.columns:
+        try:
+            p90 = df["pct_change"].abs().quantile(0.90)
+            print(f"📊 Volatility p90={p90:.2f}% | threshold={MAX_ALLOWED_VOLATILITY_P90:.2f}%")
+        except Exception:
+            pass
+    if "decision" in df.columns and "confidence" in df.columns:
+        tradeable = df[(df["decision"] == "Strong Buy") & (df["confidence"] >= MIN_CONFIDENCE_TO_TRADE)]
+        print(
+            f"✅ Tradeable strong buys={len(tradeable)} | min_required={MIN_STRONG_BUY_PICKS} | min_conf={MIN_CONFIDENCE_TO_TRADE}")
 
     df_support = df.sort_values(by=["confidence", "score"], ascending=False).head(
         max(EXCEL_MAX_ROWS, TRADE_MAX_PICKS)
@@ -768,17 +786,18 @@ def run_premarket(now: datetime):
         "forecast_trend", "forecast_atr", "forecast_reason",
         "trade_plan", "earnings_risk",
         "decision", "score", "score_label", "confidence",
-        "news_flag", "main_news_title", "main_news_link",
-        "reasons",
+        "reasons",  # ✅ moved up
+        "news_flag", "main_news_title", "main_news_link",  # ✅ now AFTER reasons
     ]
+
     support_cols = [
         "run_date", "symbol", "price_category", "current", "pct_change",
         "predicted_price", "target_price", "stop_loss",
         "forecast_trend", "forecast_atr",
         "trade_plan", "earnings_risk",
         "decision", "score", "score_label", "confidence",
-        "news_flag", "main_news_title", "main_news_link",
-        "reasons",
+        "reasons",  # ✅ moved up
+        "news_flag", "main_news_title", "main_news_link",  # ✅ now AFTER reasons
     ]
 
     daily_picks_out = daily_picks[[c for c in daily_cols if c in daily_picks.columns]].copy()
