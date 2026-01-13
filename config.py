@@ -18,9 +18,9 @@ FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 # -----------------------------
 # Universe / Limits
 # -----------------------------
-TOP_N = 20                 # how many movers you analyze & store in Excel
-EMAIL_TOP_PER_CATEGORY = 10 # email per category (but we’ll still cap total picks)
-TRADE_MAX_PICKS = 5         # the real “I might trade these” list size (2–5 is best)
+TOP_N = 20                   # how many movers you analyze & store in Excel
+EMAIL_TOP_PER_CATEGORY = 10  # if you later expand email grouping
+TRADE_MAX_PICKS = 3          # keep small for trust (2–5 is best)
 
 # -----------------------------
 # Colors (used for HTML + Excel)
@@ -30,11 +30,16 @@ TRADE_COLORS = {"✅ Preferable": "#d4edda", "⚠️ Moderate": "#fff3cd"}
 SCORE_COLORS = {"Green": "#28a745", "Yellow": "#ffc107", "Red": "#dc3545"}
 
 # -----------------------------
-# Scoring thresholds
+# Scoring thresholds (more selective = more trustworthy)
 # -----------------------------
-SCORE_HIGH = 50
-SCORE_MEDIUM = 25
+SCORE_HIGH = 65
+SCORE_MEDIUM = 45
 
+# -----------------------------
+# (Deprecated) Old upside factors
+# You switched to ATR-based forecast_engine.py
+# Keep these only so old code paths don't crash.
+# -----------------------------
 EXPECTED_UPSIDE_HIGH = 1.10
 EXPECTED_UPSIDE_MEDIUM = 1.05
 EXPECTED_DOWN = 0.98
@@ -42,9 +47,9 @@ EXPECTED_DOWN = 0.98
 # -----------------------------
 # Trust / Quality gates
 # -----------------------------
-MIN_CONFIDENCE_TO_TRADE = 8     # only allow “Approved Picks” if >= 8
-MIN_DATA_QUALITY_TO_TRADE = 8   # quality score 1–10 (we will compute in main.py)
-ALLOW_FALLBACK_DATA = False     # if True, bot can send picks even when it used sample data (not recommended)
+MIN_CONFIDENCE_TO_TRADE = 7      # 6–7 is realistic; 8 may block most days
+MIN_DATA_QUALITY_TO_TRADE = 8    # future use (if you compute quality)
+ALLOW_FALLBACK_DATA = False      # good: don't send if data was fake
 
 # -----------------------------
 # Mid-day sudden movers alert

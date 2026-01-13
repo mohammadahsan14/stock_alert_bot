@@ -3,15 +3,23 @@
 def get_price_category(price):
     """
     Categorize stock based on price:
-    - Ultra Penny: < $10
-    - Penny: $10 - $50
-    - Mid: $50 - $150
-    - Mid-High: $150 - $300
-    - High: >= $300
+
+    - Ultra Penny ($): < $10
+    - Penny ($): $10 – $50
+    - Mid ($$): $50 – $150
+    - Mid-High ($$$): $150 – $300
+    - High ($$$$): >= $300
+
+    Returns:
+        str: price category label used across email + Excel grouping
     """
     try:
         p = float(price)
     except (TypeError, ValueError):
+        return "Unknown"
+
+    # Defensive guard (bad API data / halted tickers)
+    if p <= 0:
         return "Unknown"
 
     if p < 10:

@@ -2,28 +2,52 @@
 import os
 import re
 import argparse
+import html as _html
+from pathlib import Path
 from typing import List, Tuple
 from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+
+if os.getenv("DEBUG") == "1":
+    print("RESEND_API_KEY loaded:", bool(os.getenv("RESEND_API_KEY")))
 
 import pandas as pd
 import yfinance as yf
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
-from email.message import EmailMessage
-import smtplib
 
+from forecast_engine import forecast_price_levels
+from email_sender import send_email as resend_send_email
 from top_movers import fetch_sp500_tickers, calculate_top_movers
-from scoring_engine import get_predictive_score
+
+# ✅ richer scoring API (needs to exist in scoring_engine.py)
+from scoring_engine import get_predictive_score_with_reasons
+
 from news_fetcher import fetch_news_links
 from price_category import get_price_category
 from config import (
-    SENDER_EMAIL, APP_PASSWORD, RECEIVER_EMAIL,
+    SENDER_EMAIL, RECEIVER_EMAIL,
     TOP_N, SCORE_COLORS, SCORE_HIGH, SCORE_MEDIUM,
-    EXPECTED_UPSIDE_HIGH, EXPECTED_UPSIDE_MEDIUM, EXPECTED_DOWN,
+    EXPECTED_UPSIDE_HIGH, EXPECTED_UPSIDE_MEDIUM, EXPECTED_DOWN,  # kept for compatibility
+)
+
+# ✅ Phase 2: portfolio/performance tracking
+from performance_tracker import (
+    PortfolioConfig,
+    load_open_portfolio,
+    save_open_portfolio,
+    append_trade_history,
+    add_new_positions_from_picks,
+    update_and_close_positions,
+    portfolio_summary,
 )
 
 # -----------------------------
-# Defaults (clean + minimal)
+# Output folder
 # -----------------------------
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -32,23 +56,36 @@ def out_path(filename: str) -> str:
     """Return a safe file path inside outputs/."""
     return os.path.join(OUTPUT_DIR, filename)
 
-#  Logs now live inside outputs
-DAILY_LOG_CSV = out_path("daily_stock_log.csv")        # stores ONLY picks sent
-PERF_LOG_CSV  = out_path("performance_log.csv")        # appended daily after post-market
+# Logs inside outputs/
+DAILY_LOG_CSV = out_path("daily_stock_log.csv")   # stores ONLY picks sent
+PERF_LOG_CSV = out_path("performance_log.csv")    # appended daily after post-market
 
-EXCEL_MAX_ROWS = 10        # SUPPORTING_DATA rows
-TRADE_MAX_PICKS = 3        # EMAIL + DAILY_PICKS rows
+EXCEL_MAX_ROWS = 10         # SUPPORTING_DATA rows
+TRADE_MAX_PICKS = 3         # EMAIL + DAILY_PICKS rows
 
 SUDDEN_MOVER_PCT_THRESHOLD = 3.0
-POST_MARKET_START = time(15, 10)  # 3:10 PM CST buffer (market closes 3:00 PM CST)
+
+# ✅ Always run in Chicago time (CST/CDT handled by TZ database)
+LOCAL_TZ = ZoneInfo("America/Chicago")
+POST_MARKET_START = time(15, 10)  # 3:10 PM Chicago (market closes 3:00 PM Chicago)
+
+# -----------------------------
+# Phase 2: Market-wide gates (better than "max mover")
+# -----------------------------
+VIX_SKIP_THRESHOLD = 25.0
+SPY_GAP_DOWN_SKIP_PCT = -1.25
+SPY_GAP_DOWN_TIGHTEN_PCT = -0.60
 
 # -----------------------------
 # Reliability gates (NO TRADE DAY logic)
 # -----------------------------
 MIN_STRONG_BUY_PICKS = 1
 MIN_CONFIDENCE_TO_TRADE = 6
-MAX_ALLOWED_VOLATILITY = 6.0      # if biggest mover is > 6% premarket, skip day
-MARKET_DOWNSHIFT_BLOCK = True     # if market down, require stronger evidence
+
+# IMPORTANT: use percentile (p90) of movers instead of max
+MAX_ALLOWED_VOLATILITY_P90 = 6.0
+
+MARKET_DOWNSHIFT_BLOCK = True
 
 # -----------------------------
 # Earnings filter (gap-risk protection)
@@ -126,21 +163,47 @@ def news_flag_from_headlines(headlines: List[str]) -> str:
     return "🟡"
 
 # -----------------------------
-# Market direction
+# Market snapshot + direction (SPY + VIX)
 # -----------------------------
-def get_market_direction() -> str:
+def get_market_snapshot() -> dict:
+    """
+    Returns:
+      {
+        "trend": "up"|"down",
+        "spy_gap_pct": float,
+        "vix": float|None
+      }
+    """
+    out = {"trend": "up", "spy_gap_pct": 0.0, "vix": None}
     try:
-        sp500 = yf.Ticker("^GSPC").history(period="2d")["Close"]
-        return "up" if sp500.iloc[-1] > sp500.iloc[-2] else "down"
+        spy = yf.Ticker("SPY").history(period="2d")
+        if not spy.empty and len(spy) >= 2:
+            prev_close = float(spy["Close"].iloc[-2])
+            last_close = float(spy["Close"].iloc[-1])
+            out["trend"] = "up" if last_close > prev_close else "down"
+            out["spy_gap_pct"] = ((last_close - prev_close) / prev_close) * 100.0
     except Exception:
-        return "up"
+        pass
+
+    try:
+        vix = yf.Ticker("^VIX").history(period="1d")
+        if not vix.empty:
+            out["vix"] = float(vix["Close"].iloc[-1])
+    except Exception:
+        pass
+
+    return out
+
+def get_market_direction() -> str:
+    return get_market_snapshot().get("trend", "up")
 
 # -----------------------------
-# Confidence model (simple + stable)
+# Confidence model (gentler on big movers)
 # -----------------------------
 def compute_confidence(score_val: int, pct_change: float, market_trend: str, news_flag: str) -> int:
     base = score_val / 10.0  # 0..10
-    vol_adj = max(0.7, 1 - abs(pct_change) / 10.0)  # floor 0.7
+    pct_for_conf = min(abs(pct_change), 5.0)
+    vol_adj = max(0.75, 1 - pct_for_conf / 12.0)
     market_adj = 1.05 if market_trend == "up" else 0.95
     news_adj = 1.05 if news_flag == "🟢" else (0.95 if news_flag == "🔴" else 1.0)
     conf = int(round(base * vol_adj * market_adj * news_adj))
@@ -188,19 +251,31 @@ def assign_trade_plan(risk: str, pct_change: float, market_trend: str, score_val
     return "Intraday"
 
 # -----------------------------
-# NO TRADE DAY logic
+# NO TRADE DAY logic (improved)
 # -----------------------------
-def should_skip_day(df: pd.DataFrame, market_trend: str) -> Tuple[bool, str]:
+def should_skip_day(df: pd.DataFrame, market_trend: str, snapshot: dict) -> Tuple[bool, str]:
     if df is None or df.empty:
         return True, "Empty dataset"
 
-    if "current" not in df.columns or df["current"].isna().any():
+    if "current" not in df.columns:
+        return True, "Missing prices"
+
+    if df["current"].isna().any() or (df["current"] <= 0).any():
         return True, "Missing/invalid prices"
 
+    vix = snapshot.get("vix")
+    if vix is not None and vix >= VIX_SKIP_THRESHOLD:
+        return True, f"Risk-off day: VIX too high ({vix:.2f})"
+
+    spy_gap = float(snapshot.get("spy_gap_pct") or 0.0)
+    if spy_gap <= SPY_GAP_DOWN_SKIP_PCT:
+        return True, f"Risk-off day: SPY weak ({spy_gap:.2f}%)"
+
     if "pct_change" in df.columns:
-        extreme = df["pct_change"].abs().max()
-        if pd.notna(extreme) and extreme >= MAX_ALLOWED_VOLATILITY:
-            return True, f"Market too volatile today (max mover {extreme:.2f}%)"
+        p90 = df["pct_change"].abs().quantile(0.90)
+        if pd.notna(p90) and p90 >= MAX_ALLOWED_VOLATILITY_P90:
+            if market_trend == "down" or spy_gap <= SPY_GAP_DOWN_TIGHTEN_PCT:
+                return True, f"Too volatile (p90 mover {p90:.2f}%) with weak market bias"
 
     if "decision" in df.columns and "confidence" in df.columns:
         tradeable = df[(df["decision"] == "Strong Buy") & (df["confidence"] >= MIN_CONFIDENCE_TO_TRADE)]
@@ -294,33 +369,44 @@ def build_email_html_top_picks(df: pd.DataFrame, run_date: str) -> str:
         if cat_df.empty:
             continue
 
-        html += f"<h3>{cat_name}</h3>"
+        html += f"<h3>{_html.escape(cat_name)}</h3>"
         html += "<table style='border-collapse:collapse;font-family:Arial;width:100%;margin-bottom:18px;'>"
         html += """
         <tr style='background:#f2f2f2;'>
           <th style='padding:6px;border:1px solid #ddd;'>Symbol</th>
           <th style='padding:6px;border:1px solid #ddd;'>Price</th>
           <th style='padding:6px;border:1px solid #ddd;'>Predicted</th>
+          <th style='padding:6px;border:1px solid #ddd;'>Target</th>
+          <th style='padding:6px;border:1px solid #ddd;'>Stop</th>
           <th style='padding:6px;border:1px solid #ddd;'>Plan</th>
           <th style='padding:6px;border:1px solid #ddd;'>Decision</th>
           <th style='padding:6px;border:1px solid #ddd;'>Score</th>
           <th style='padding:6px;border:1px solid #ddd;'>Conf</th>
           <th style='padding:6px;border:1px solid #ddd;'>News</th>
+          <th style='padding:6px;border:1px solid #ddd;'>Why</th>
         </tr>
         """
         for _, row in cat_df.iterrows():
-            label = row.get("score_label", "")
+            label = str(row.get("score_label", "") or "")
             score_color = SCORE_COLORS.get(label, "#FFFFFF")
+
+            why = _html.escape(str(row.get("reasons", "") or ""))
+            if len(why) > 240:
+                why = why[:240] + "..."
+
             html += f"""
             <tr>
-              <td style='padding:6px;border:1px solid #ddd;'>{row.get('symbol','')}</td>
-              <td style='padding:6px;border:1px solid #ddd;'>{row.get('current',0):.2f}</td>
-              <td style='padding:6px;border:1px solid #ddd;'>{row.get('predicted_price',0):.2f}</td>
-              <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{row.get('trade_plan','')}</td>
-              <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{row.get('decision','')}</td>
-              <td style='padding:6px;border:1px solid #ddd;background:{score_color};text-align:center;'>{label} ({int(row.get('score',0))})</td>
-              <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{int(row.get('confidence',0))}</td>
-              <td style='padding:6px;border:1px solid #ddd;text-align:center;font-size:16px;'>{row.get('news_flag','🟡')}</td>
+              <td style='padding:6px;border:1px solid #ddd;'>{_html.escape(str(row.get('symbol','')))}</td>
+              <td style='padding:6px;border:1px solid #ddd;'>{float(row.get('current',0) or 0):.2f}</td>
+              <td style='padding:6px;border:1px solid #ddd;'>{float(row.get('predicted_price',0) or 0):.2f}</td>
+              <td style='padding:6px;border:1px solid #ddd;'>{float(row.get('target_price',0) or 0):.2f}</td>
+              <td style='padding:6px;border:1px solid #ddd;'>{float(row.get('stop_loss',0) or 0):.2f}</td>
+              <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{_html.escape(str(row.get('trade_plan','') or ''))}</td>
+              <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{_html.escape(str(row.get('decision','') or ''))}</td>
+              <td style='padding:6px;border:1px solid #ddd;background:{score_color};text-align:center;'>{_html.escape(label)} ({int(row.get('score',0) or 0)})</td>
+              <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{int(row.get('confidence',0) or 0)}</td>
+              <td style='padding:6px;border:1px solid #ddd;text-align:center;font-size:16px;'>{_html.escape(str(row.get('news_flag','🟡') or '🟡'))}</td>
+              <td style='padding:6px;border:1px solid #ddd;'>{why}</td>
             </tr>
             """
         html += "</table>"
@@ -328,34 +414,16 @@ def build_email_html_top_picks(df: pd.DataFrame, run_date: str) -> str:
     return html
 
 # -----------------------------
-# Send email
+# Send email (Resend wrapper)
 # -----------------------------
-def send_email(subject: str, html_body: str, attachment_path: str = None):
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = RECEIVER_EMAIL
-    msg.add_alternative(html_body, subtype="html")
-
-    if attachment_path:
-        try:
-            with open(attachment_path, "rb") as f:
-                msg.add_attachment(
-                    f.read(),
-                    maintype="application",
-                    subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    filename=os.path.basename(attachment_path),
-                )
-        except Exception as e:
-            print("⚠️ Attachment failed:", e)
-
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(SENDER_EMAIL, APP_PASSWORD)
-            smtp.send_message(msg)
-        print("✅ Email sent:", subject)
-    except Exception as e:
-        print("❌ Email failed:", e)
+def send_email(subject: str, html_body: str, attachment_path: str | None = None) -> bool:
+    return resend_send_email(
+        subject=subject,
+        html_body=html_body,
+        to_email=RECEIVER_EMAIL,
+        from_email=SENDER_EMAIL,
+        attachment_path=attachment_path,
+    )
 
 # -----------------------------
 # Post-market evaluation (reads picks log)
@@ -379,6 +447,7 @@ def evaluate_post_market_from_log(log_csv: str) -> pd.DataFrame:
         close_prices.append(close)
 
     df["close_price"] = close_prices
+    df["current"] = pd.to_numeric(df.get("current", pd.Series([float("nan")] * len(df))), errors="coerce")
     df["actual_change_pct"] = (df["close_price"] - df["current"]) / df["current"] * 100
 
     outcomes = []
@@ -392,6 +461,7 @@ def evaluate_post_market_from_log(log_csv: str) -> pd.DataFrame:
             outcomes.append("✅ Correct")
         else:
             outcomes.append("❌ Incorrect")
+
     df["outcome"] = outcomes
     return df
 
@@ -411,24 +481,32 @@ def build_midday_alert(df: pd.DataFrame, run_date: str) -> str:
       <th style='padding:6px;border:1px solid #ddd;'>Decision</th>
       <th style='padding:6px;border:1px solid #ddd;'>Score</th>
       <th style='padding:6px;border:1px solid #ddd;'>Conf</th>
+      <th style='padding:6px;border:1px solid #ddd;'>Why</th>
       <th style='padding:6px;border:1px solid #ddd;'>Main News</th>
     </tr>
     """
+
     for _, row in df.iterrows():
-        link = row.get("main_news_link", "")
-        title = row.get("main_news_title", "")
-        link_html = f'<a href="{link}" target="_blank">{title}</a>' if link else (title or "—")
+        link = str(row.get("main_news_link", "") or "")
+        title = _html.escape(str(row.get("main_news_title", "") or "—"))
+        link_html = f'<a href="{_html.escape(link)}" target="_blank">{title}</a>' if link else title
+
+        why = _html.escape(str(row.get("reasons", "") or ""))
+        if len(why) > 200:
+            why = why[:200] + "..."
 
         html += f"""
         <tr>
-          <td style='padding:6px;border:1px solid #ddd;'>{row.get('symbol')}</td>
-          <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{row.get('pct_change',0):.2f}%</td>
-          <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{row.get('decision')}</td>
-          <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{row.get('score')}</td>
-          <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{row.get('confidence')}</td>
+          <td style='padding:6px;border:1px solid #ddd;'>{_html.escape(str(row.get('symbol','')))}</td>
+          <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{float(row.get('pct_change',0) or 0):.2f}%</td>
+          <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{_html.escape(str(row.get('decision','') or ''))}</td>
+          <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{int(row.get('score',0) or 0)}</td>
+          <td style='padding:6px;border:1px solid #ddd;text-align:center;'>{int(row.get('confidence',0) or 0)}</td>
+          <td style='padding:6px;border:1px solid #ddd;'>{why}</td>
           <td style='padding:6px;border:1px solid #ddd;'>{link_html}</td>
         </tr>
         """
+
     html += "</table>"
     return html
 
@@ -452,7 +530,7 @@ def build_weekly_dashboard_html(perf_csv: str, now: datetime) -> str:
         return "<p>No trades in last 7 days.</p>"
 
     total = len(last7)
-    correct = int((last7["outcome"] == "✅ Correct").sum()) if "outcome" in last7.columns else 0
+    correct = int((last7.get("outcome") == "✅ Correct").sum()) if "outcome" in last7.columns else 0
     rate = (correct / total * 100) if total else 0
     avg_move = last7["actual_change_pct"].mean() if "actual_change_pct" in last7.columns else 0
 
@@ -462,7 +540,7 @@ def build_weekly_dashboard_html(perf_csv: str, now: datetime) -> str:
     def rows(df2):
         out = ""
         for _, r in df2.iterrows():
-            out += f"<li>{r['symbol']}: {r['actual_change_pct']:.2f}%</li>"
+            out += f"<li>{_html.escape(str(r['symbol']))}: {float(r['actual_change_pct']):.2f}%</li>"
         return out or "<li>—</li>"
 
     return f"""
@@ -482,22 +560,18 @@ def build_weekly_dashboard_html(perf_csv: str, now: datetime) -> str:
 # PRE-MARKET
 # -----------------------------
 def run_premarket(now: datetime):
-    market_trend = get_market_direction()
+    snapshot = get_market_snapshot()
+    market_trend = snapshot.get("trend", "up")
 
     tickers = fetch_sp500_tickers()
     movers = calculate_top_movers(tickers, TOP_N)
     df = pd.DataFrame(movers)
-    print("movers len:", len(movers))
-    print(df.head(3))
-    print(df.columns)
 
     if df.empty:
         raise RuntimeError("Top movers returned empty dataset. Refusing to run.")
 
-    # Score a bit more than we keep, then cut down
     df = df.head(max(EXCEL_MAX_ROWS, 20)).copy()
 
-    # Ensure required columns
     if "pct_change" not in df.columns:
         df["pct_change"] = 0.0
     df["pct_change"] = pd.to_numeric(df["pct_change"], errors="coerce").fillna(0.0)
@@ -507,12 +581,19 @@ def run_premarket(now: datetime):
             df["current"] = df["price"]
         else:
             raise RuntimeError("Missing 'current' price column from top_movers output.")
-    df["current"] = pd.to_numeric(df["current"], errors="coerce").fillna(0.0)
+    df["current"] = pd.to_numeric(df["current"], errors="coerce")
 
-    scores, labels, confs = [], [], []
+    # remove invalid price rows early
+    df = df[df["current"].notna() & (df["current"] > 0)].copy()
+    if df.empty:
+        raise RuntimeError("All rows had invalid prices. Refusing to run.")
+
+    scores, labels, reasons_list, confs = [], [], [], []
     main_titles, main_links, flags = [], [], []
     decisions, predicted_prices, targets, stops, categories = [], [], [], [], []
     earnings_risks, trade_plans = [], []
+
+    forecast_reason_list, forecast_trend_list, forecast_atr_list = [], [], []
 
     for _, row in df.iterrows():
         sym = row["symbol"]
@@ -520,15 +601,10 @@ def run_premarket(now: datetime):
         risk = str(row.get("risk", "Medium"))
         pct = float(row.get("pct_change", 0.0))
 
-        score_val, score_label = get_predictive_score(sym)
+        score_val, score_label, reasons = get_predictive_score_with_reasons(sym)
         score_val = int(score_val)
         decision = map_score_to_decision(score_val)
 
-        factor = EXPECTED_UPSIDE_HIGH if score_val >= SCORE_HIGH else (
-            EXPECTED_UPSIDE_MEDIUM if score_val >= SCORE_MEDIUM else EXPECTED_DOWN
-        )
-
-        # News
         news_items = fetch_news_links(sym, max_articles=3)
         main_item = news_items[0] if news_items else ""
         title = extract_headline_from_html(main_item)
@@ -536,41 +612,61 @@ def run_premarket(now: datetime):
         headlines = [extract_headline_from_html(x) for x in news_items if x]
         flag = news_flag_from_headlines(headlines)
 
-        # Earnings risk
         erisk = has_earnings_soon(sym, now, EARNINGS_LOOKAHEAD_DAYS)
         if SKIP_EARNINGS_STOCKS and erisk:
             decision = "Not Advisable"
 
         conf = compute_confidence(score_val, pct, market_trend, flag)
-
-        # Trade plan
         tplan = assign_trade_plan(risk=risk, pct_change=pct, market_trend=market_trend, score_val=score_val)
 
         scores.append(score_val)
         labels.append(score_label)
+        reasons_list.append(reasons)
         confs.append(conf)
+
         main_titles.append(title)
         main_links.append(link)
         flags.append(flag)
         decisions.append(decision)
 
-        predicted = current * factor
-        predicted_prices.append(predicted)
-        targets.append(predicted)
-        stops.append(current * 0.97)
+        try:
+            fc = forecast_price_levels(sym, current=current, score=score_val)
+        except Exception:
+            fc = None
+
+        if fc is None:
+            predicted_prices.append(current)
+            targets.append(current)
+            stops.append(current * 0.97)
+            forecast_reason_list.append("Forecast unavailable (fallback used)")
+            forecast_trend_list.append("unknown")
+            forecast_atr_list.append(0.0)
+        else:
+            predicted_prices.append(float(getattr(fc, "predicted_price", current)))
+            targets.append(float(getattr(fc, "target_price", getattr(fc, "predicted_price", current))))
+            stops.append(float(getattr(fc, "stop_loss", current * 0.97)))
+            forecast_reason_list.append(str(getattr(fc, "reason", "")))
+            forecast_trend_list.append(str(getattr(fc, "trend", "")))
+            forecast_atr_list.append(float(getattr(fc, "atr", 0.0)))
 
         categories.append(get_price_category(current) if current > 0 else "Unknown")
         earnings_risks.append("YES" if erisk else "NO")
         trade_plans.append(tplan)
 
-    # attach computed columns
     df["score"] = scores
     df["score_label"] = labels
+    df["reasons"] = reasons_list
     df["confidence"] = confs
     df["decision"] = decisions
+
     df["predicted_price"] = predicted_prices
     df["target_price"] = targets
     df["stop_loss"] = stops
+
+    df["forecast_trend"] = forecast_trend_list
+    df["forecast_atr"] = forecast_atr_list
+    df["forecast_reason"] = forecast_reason_list
+
     df["price_category"] = categories
     df["news_flag"] = flags
     df["main_news_title"] = main_titles
@@ -579,52 +675,59 @@ def run_premarket(now: datetime):
     df["trade_plan"] = trade_plans
     df["run_date"] = now.strftime("%Y-%m-%d")
 
-    # Reduce supporting set
-    df = df.sort_values(by=["confidence", "score"], ascending=False).head(max(EXCEL_MAX_ROWS, TRADE_MAX_PICKS)).copy()
+    # ✅ NO TRADE DAY check (improved)
+    skip, reason = should_skip_day(df, market_trend, snapshot)
 
-    # Picks sent (Strong Buy + confidence gate)
+    df_support = df.sort_values(by=["confidence", "score"], ascending=False).head(
+        max(EXCEL_MAX_ROWS, TRADE_MAX_PICKS)
+    ).copy()
+
     daily_picks = (
-        df[(df["decision"] == "Strong Buy") & (df["confidence"] >= MIN_CONFIDENCE_TO_TRADE)]
+        df_support[(df_support["decision"] == "Strong Buy") & (df_support["confidence"] >= MIN_CONFIDENCE_TO_TRADE)]
         .sort_values(by=["confidence", "score"], ascending=False)
         .head(TRADE_MAX_PICKS)
         .copy()
     )
     if daily_picks.empty:
-        daily_picks = df.sort_values(by=["confidence", "score"], ascending=False).head(min(TRADE_MAX_PICKS, len(df))).copy()
+        daily_picks = df_support.sort_values(by=["confidence", "score"], ascending=False).head(
+            min(TRADE_MAX_PICKS, len(df_support))
+        ).copy()
 
-    # NO TRADE DAY check (after scoring)
-    skip, reason = should_skip_day(df, market_trend)
-    if daily_picks.empty:
-        daily_picks = df.sort_values(by=["confidence", "score"], ascending=False).head(TRADE_MAX_PICKS).copy()
-
-    # Save daily log = PICKS ONLY (for evaluation)
+    # ✅ store picks sent for post-market evaluation
     daily_picks.to_csv(DAILY_LOG_CSV, index=False)
 
-    # Excel (3 sheets only)
     daily_cols = [
         "run_date", "symbol", "price_category",
         "current", "predicted_price", "target_price", "stop_loss",
+        "forecast_trend", "forecast_atr", "forecast_reason",
         "trade_plan", "earnings_risk",
         "decision", "score", "score_label", "confidence",
-        "news_flag", "main_news_title", "main_news_link"
+        "news_flag", "main_news_title", "main_news_link",
+        "reasons",
     ]
     support_cols = [
         "run_date", "symbol", "price_category", "current", "pct_change",
-        "predicted_price", "trade_plan", "earnings_risk",
+        "predicted_price", "target_price", "stop_loss",
+        "forecast_trend", "forecast_atr",
+        "trade_plan", "earnings_risk",
         "decision", "score", "score_label", "confidence",
-        "news_flag", "main_news_title", "main_news_link"
+        "news_flag", "main_news_title", "main_news_link",
+        "reasons",
     ]
 
-    daily_picks_out = daily_picks[[c for c in daily_cols if c in daily_picks.columns]]
-    supporting = df[[c for c in support_cols if c in df.columns]]
+    daily_picks_out = daily_picks[[c for c in daily_cols if c in daily_picks.columns]].copy()
+    supporting = df_support[[c for c in support_cols if c in df_support.columns]].copy()
 
     perf = pd.DataFrame([{
         "run_date": now.strftime("%Y-%m-%d"),
         "picks_sent": len(daily_picks_out),
-        "note": "Post-market updates win-rate (based on picks sent)."
+        "note": "Post-market updates win-rate (based on picks sent).",
+        "market_trend": market_trend,
+        "spy_gap_pct": float(snapshot.get("spy_gap_pct") or 0.0),
+        "vix": snapshot.get("vix"),
     }])
 
-    pre_excel = f"stock_watchlist_{now.strftime('%Y%m%d')}.xlsx"
+    pre_excel = out_path(f"stock_watchlist_{now.strftime('%Y%m%d')}.xlsx")
     with pd.ExcelWriter(pre_excel, engine="openpyxl") as writer:
         daily_picks_out.to_excel(writer, sheet_name="DAILY_PICKS", index=False)
         supporting.to_excel(writer, sheet_name="SUPPORTING_DATA", index=False)
@@ -635,20 +738,52 @@ def run_premarket(now: datetime):
         style_excel_sheet(wb[s])
     wb.save(pre_excel)
 
-    # If NO TRADE DAY, email that instead of picks
+    # ✅ Phase 2: Update portfolio + close positions + add today's picks (ONLY IF NOT SKIPPED)
+    # This ensures "no trade day" doesn't add new positions.
+    psummary_text = ""
+    if not skip:
+        try:
+            cfg = PortfolioConfig()
+            open_df = load_open_portfolio(cfg)
+
+            # 1) Update/close existing
+            remaining_open, closed_today = update_and_close_positions(cfg, open_df, asof=now)
+
+            # 2) Save closed trades to history
+            if closed_today is not None and not closed_today.empty:
+                append_trade_history(cfg, closed_today)
+
+            # 3) Add today's picks into portfolio (respect max open slots)
+            remaining_open, added_today = add_new_positions_from_picks(
+                cfg=cfg,
+                open_df=remaining_open,
+                picks_df=daily_picks_out,
+                run_date=now,
+            )
+
+            # 4) Save updated open file
+            save_open_portfolio(cfg, remaining_open)
+
+            # 5) Summary for potential email footer
+            psummary_text = portfolio_summary(remaining_open, closed_today)
+        except Exception as e:
+            # If portfolio logic fails, don't break the daily email.
+            psummary_text = f"Portfolio update failed: {e}"
+
     if skip:
         html = f"""
         <h2>🛑 NO TRADE DAY – Pre Market ({now.strftime('%Y-%m-%d')})</h2>
-        <p><b>Reason:</b> {reason}</p>
+        <p><b>Reason:</b> {_html.escape(reason)}</p>
+        <p><b>Market:</b> trend={_html.escape(market_trend)}, SPY={float(snapshot.get("spy_gap_pct") or 0.0):.2f}%, VIX={(snapshot.get("vix") if snapshot.get("vix") is not None else "n/a")}</p>
         <p>Excel is attached for review, but no picks were sent for trading today.</p>
         """
         send_email(f"🛑 NO TRADE DAY – Pre Market ({now.strftime('%Y-%m-%d')})", html, attachment_path=pre_excel)
         return
 
-    # Normal picks email
-    email_html = build_email_html_top_picks(daily_picks, now.strftime("%Y-%m-%d"))
-    print("daily_picks cols:", daily_picks.columns.tolist())
-    print(daily_picks[["symbol", "current", "predicted_price"]].head())
+    email_html = build_email_html_top_picks(daily_picks_out, now.strftime("%Y-%m-%d"))
+    if psummary_text:
+        email_html += f"<hr><h3>📁 Portfolio</h3><pre>{_html.escape(psummary_text)}</pre>"
+
     send_email(f"📈 Daily Stock Alert – Pre Market ({now.strftime('%Y-%m-%d')})", email_html, attachment_path=pre_excel)
 
 # -----------------------------
@@ -666,14 +801,16 @@ def run_midday(now: datetime):
     if df.empty:
         return
 
-    market_trend = get_market_direction()
+    snapshot = get_market_snapshot()
+    market_trend = snapshot.get("trend", "up")
 
-    scores, labels, confs, decisions = [], [], [], []
+    scores, labels, reasons_list, confs, decisions = [], [], [], [], []
     titles, links = [], []
 
     for _, row in df.iterrows():
         sym = row["symbol"]
-        score_val, score_label = get_predictive_score(sym)
+
+        score_val, score_label, reasons = get_predictive_score_with_reasons(sym)
         score_val = int(score_val)
         decision = map_score_to_decision(score_val)
 
@@ -687,6 +824,7 @@ def run_midday(now: datetime):
 
         scores.append(score_val)
         labels.append(score_label)
+        reasons_list.append(reasons)
         decisions.append(decision)
         confs.append(conf)
         titles.append(title)
@@ -694,6 +832,7 @@ def run_midday(now: datetime):
 
     df["score"] = scores
     df["score_label"] = labels
+    df["reasons"] = reasons_list
     df["decision"] = decisions
     df["confidence"] = confs
     df["main_news_title"] = titles
@@ -714,15 +853,31 @@ def run_postmarket(now: datetime):
         print("⏳ Post-market skipped (too early).")
         return
 
+    # ✅ Phase 2: update/close open positions and keep summary for email
+    psummary_text = ""
+    try:
+        cfg = PortfolioConfig()
+        open_df = load_open_portfolio(cfg)
+        remaining_open, closed_today = update_and_close_positions(cfg, open_df, asof=now)
+        if closed_today is not None and not closed_today.empty:
+            append_trade_history(cfg, closed_today)
+        save_open_portfolio(cfg, remaining_open)
+        psummary_text = portfolio_summary(remaining_open, closed_today)
+    except Exception as e:
+        psummary_text = f"Portfolio update failed: {e}"
+
     df = evaluate_post_market_from_log(DAILY_LOG_CSV)
     if df.empty:
-        send_email(
-            f"📊 Post-Market Summary ({now.strftime('%Y-%m-%d')})",
-            "<p>No picks log found / empty picks log — cannot evaluate today.</p>",
-        )
+        html = f"""
+        <h2>📊 Post-Market Summary ({now.strftime('%Y-%m-%d')})</h2>
+        <p>No picks log found / empty picks log — cannot evaluate today.</p>
+        """
+        if psummary_text:
+            html += f"<h3>📁 Portfolio Summary</h3><pre>{_html.escape(psummary_text)}</pre>"
+        send_email(f"📊 Post-Market Summary ({now.strftime('%Y-%m-%d')})", html)
         return
 
-    correct = int((df["outcome"] == "✅ Correct").sum())
+    correct = int((df["outcome"] == "✅ Correct").sum()) if "outcome" in df.columns else 0
     total = len(df)
     rate = (correct / total * 100) if total else 0
 
@@ -733,8 +888,10 @@ def run_postmarket(now: datetime):
        <b>Incorrect:</b> {total - correct}<br>
        <b>Success Rate:</b> {rate:.2f}%</p>
     """
+    if psummary_text:
+        summary_html += f"<h3>📁 Portfolio Summary</h3><pre>{_html.escape(psummary_text)}</pre>"
 
-    post_excel = f"post_market_{now.strftime('%Y%m%d')}.xlsx"
+    post_excel = out_path(f"post_market_{now.strftime('%Y%m%d')}.xlsx")
     df.to_excel(post_excel, index=False)
     wb = load_workbook(post_excel)
     for s in wb.sheetnames:
@@ -743,7 +900,7 @@ def run_postmarket(now: datetime):
 
     send_email(f"📊 Post-Market Stock Summary ({now.strftime('%Y-%m-%d')})", summary_html, attachment_path=post_excel)
 
-    # Append performance log (row-per-pick)
+    # Append to perf log
     out = df.copy()
     if "run_date" not in out.columns:
         out["run_date"] = now.strftime("%Y-%m-%d")
@@ -761,9 +918,10 @@ def run_postmarket(now: datetime):
     except Exception as e:
         print("⚠️ Perf log append failed:", e)
 
-    # Weekly dashboard email every Friday
     if now.weekday() == 4:
         dash = build_weekly_dashboard_html(PERF_LOG_CSV, now)
+        if psummary_text:
+            dash += f"<h3>📁 Current Portfolio</h3><pre>{_html.escape(psummary_text)}</pre>"
         send_email(f"📅 Weekly Trading Dashboard ({now.strftime('%Y-%m-%d')})", dash)
 
 # -----------------------------
@@ -774,7 +932,8 @@ def main():
     parser.add_argument("--mode", choices=["premarket", "midday", "postmarket"], default="premarket")
     args = parser.parse_args()
 
-    now = datetime.now()
+    # ✅ always in Chicago TZ
+    now = datetime.now(LOCAL_TZ)
 
     if args.mode == "premarket":
         run_premarket(now)
