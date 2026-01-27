@@ -101,6 +101,12 @@ def make_run_id(now: datetime) -> str:
     return now.strftime("%Y%m%d_%H%M%S")
 
 
+def _premarket_email_marker(now: datetime) -> Path:
+    # outputs/prod/runs/YYYYMMDD/premarket/email_sent_YYYY-MM-DD.txt
+    d = run_dir(now, "premarket")
+    run_date = now.strftime("%Y-%m-%d")
+    return d / f"email_sent_{run_date}.txt"
+
 # -----------------------------
 # Email routing (env-aware)
 # -----------------------------
@@ -412,6 +418,11 @@ def run_premarket(now: datetime | None = None) -> None:
     mode = "premarket"
     rf = run_dir(now, mode)
     run_date = now.strftime("%Y-%m-%d")
+    # Prevent duplicate emails for same run_date
+    marker = _premarket_email_marker(now)
+    if marker.exists():
+        print("📩 Premarket email already sent for this run_date — skipping resend.")
+        return
 
     tickers = fetch_sp500_tickers()
     movers = calculate_top_movers(tickers, top_n=TOP_N)
@@ -605,7 +616,8 @@ def run_premarket(now: datetime | None = None) -> None:
         <p><b>Monitor Mode:</b> See Excel sheets <b>MONITOR_TOP20</b> and <b>ALL_SCORED</b>.</p>
         <p><b>Attachment:</b> Excel included.</p>
         """
-        send_email(f"🌅 Premarket Picks ({run_date})", html, attachment_path=excel_path)
+        if send_email(f"🌅 Premarket Picks ({run_date})", html, attachment_path=excel_path):
+            marker.write_text("sent\n", encoding="utf-8")
         return
 
     def _fmt_money(v) -> str:
@@ -662,7 +674,8 @@ def run_premarket(now: datetime | None = None) -> None:
 
     <p><b>Attachment:</b> Excel included with sheets: PICKS, CANDIDATES, MONITOR_TOP20, ALL_SCORED, RAW_MOVERS.</p>
     """
-    send_email(f"🌅 Premarket Picks ({run_date})", html, attachment_path=excel_path)
+    if send_email(f"🌅 Premarket Picks ({run_date})", html, attachment_path=excel_path):
+        marker.write_text("sent\n", encoding="utf-8")
     print(f"✅ Premarket complete | picks={len(picks_df)} | excel={excel_path}")
 
 
