@@ -27,10 +27,22 @@ def _safe_float(x, default: float = 0.0) -> float:
         return default
 
 
+def _fetch_history(symbol: str, lookback: str) -> pd.DataFrame:
+    """
+    yfinance can be flaky; keep this hardened and simple.
+    """
+    try:
+        df = yf.Ticker(symbol).history(period=lookback, auto_adjust=False)
+        if isinstance(df, pd.DataFrame):
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
 def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
     """
-    Average True Range (ATR) from OHLC history.
-    Uses SMA on True Range; stable and simple.
+    ATR via SMA(TrueRange). Stable, low-risk.
     """
     if df is None or df.empty:
         return 0.0
@@ -39,9 +51,9 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
     if len(df) < period + 2:
         return 0.0
 
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
+    high = pd.to_numeric(df["High"], errors="coerce")
+    low = pd.to_numeric(df["Low"], errors="coerce")
+    close = pd.to_numeric(df["Close"], errors="coerce")
     prev_close = close.shift(1)
 
     tr = pd.concat(
@@ -55,7 +67,7 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
 
 def compute_trend(df: pd.DataFrame) -> str:
     """
-    Simple trend detection using SMA20 vs SMA50 and latest close vs SMA20.
+    Trend via SMA20/SMA50 and last vs SMA20.
     """
     if df is None or df.empty:
         return "sideways"
@@ -64,7 +76,10 @@ def compute_trend(df: pd.DataFrame) -> str:
     if len(df) < 55:
         return "sideways"
 
-    close = df["Close"]
+    close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if len(close) < 55:
+        return "sideways"
+
     sma20 = close.rolling(20).mean().iloc[-1]
     sma50 = close.rolling(50).mean().iloc[-1]
     last = close.iloc[-1]
@@ -81,7 +96,7 @@ def compute_trend(df: pd.DataFrame) -> str:
 
 def _score_to_multipliers(score: int) -> Tuple[float, float]:
     """
-    Convert score -> (target_ATR_multiple, stop_ATR_multiple)
+    score -> (target_ATR_multiple, stop_ATR_multiple)
     """
     if score >= 70:
         return 2.2, 1.2
@@ -97,94 +112,116 @@ def forecast_price_levels(
     current: float,
     score: int,
     lookback: str = "3mo",
-    max_up_pct: float = 0.15,   # safety clamp
-    max_down_pct: float = 0.10  # safety clamp
+    max_up_pct: float = 0.15,     # safety clamp
+    max_down_pct: float = 0.10,   # safety clamp
+    min_stop_pct: float = 0.02,   # ensures stop isn't too tight/useless
+    min_atr_pct: float = 0.002,   # 0.2% of price (below this ATR is "too small")
+    max_atr_pct: float = 0.12,    # 12% of price (above this ATR is "too wild")
 ) -> ForecastResult:
     """
-    Produces predicted/target/stop based on ATR + trend bias.
-
-    - predicted_price: expected level
-    - target_price: take-profit level
-    - stop_loss: ATR-based stop
+    ATR + trend bias forecast (monitoring-safe).
+    Adds sanity checks so we don't generate nonsense.
     """
     current = _safe_float(current, 0.0)
     if current <= 0:
-        return ForecastResult(
-            predicted_price=0.0,
-            target_price=0.0,
-            stop_loss=0.0,
-            atr=0.0,
-            trend="sideways",
-            reason="Invalid current price"
-        )
+        return ForecastResult(0.0, 0.0, 0.0, 0.0, "sideways", "Invalid current price")
 
-    try:
-        df = yf.Ticker(symbol).history(period=lookback, auto_adjust=False)
-
-        if df is None or df.empty or len(df) < 20:
-            return ForecastResult(
-                predicted_price=current,
-                target_price=current,
-                stop_loss=max(0.01, current * 0.97),
-                atr=0.0,
-                trend="sideways",
-                reason="Not enough history; fallback used"
-            )
-
-        df = df.dropna(subset=["High", "Low", "Close"]).copy()
-
-        atr = compute_atr(df, period=14)
-        trend = compute_trend(df)
-
-        if atr <= 0:
-            return ForecastResult(
-                predicted_price=current,
-                target_price=current,
-                stop_loss=max(0.01, current * 0.97),
-                atr=0.0,
-                trend=trend,
-                reason="ATR unavailable; fallback stop used"
-            )
-
-        k, m = _score_to_multipliers(int(score))
-
-        # trend bias (small nudges)
-        if trend == "up":
-            k *= 1.10
-        elif trend == "down":
-            k *= 0.85
-            m *= 1.10
-
-        predicted = current + (k * atr)
-        target = current + ((k + 0.30) * atr)  # slightly above predicted
-        stop = current - (m * atr)
-
-        # Safety clamps (prevents absurd levels due to weird ATR)
-        predicted = min(predicted, current * (1 + max_up_pct))
-        target = min(target, current * (1 + max_up_pct))
-        stop = max(stop, current * (1 - max_down_pct))
-
-        predicted = max(0.01, predicted)
-        target = max(0.01, target)
-        stop = max(0.01, stop)
-
-        reason = f"ATR(14)={atr:.2f}, trend={trend}, k={k:.2f}, m={m:.2f}, clamp=+{max_up_pct:.0%}/-{max_down_pct:.0%}"
-
-        return ForecastResult(
-            predicted_price=float(predicted),
-            target_price=float(target),
-            stop_loss=float(stop),
-            atr=float(atr),
-            trend=trend,
-            reason=reason
-        )
-
-    except Exception as e:
+    # Fetch history (hardened)
+    df = _fetch_history(symbol, lookback=lookback)
+    if df is None or df.empty or len(df) < 20:
+        stop = max(0.01, current * (1 - max(max_down_pct, min_stop_pct)))
         return ForecastResult(
             predicted_price=current,
             target_price=current,
-            stop_loss=max(0.01, current * 0.97),
+            stop_loss=stop,
             atr=0.0,
             trend="sideways",
-            reason=f"Forecast error fallback: {e}"
+            reason="Not enough history; fallback used"
         )
+
+    df = df.dropna(subset=["High", "Low", "Close"]).copy()
+    trend = compute_trend(df)
+    atr = compute_atr(df, period=14)
+
+    if atr <= 0:
+        stop = max(0.01, current * (1 - max(max_down_pct, min_stop_pct)))
+        return ForecastResult(
+            predicted_price=current,
+            target_price=current,
+            stop_loss=stop,
+            atr=0.0,
+            trend=trend,
+            reason="ATR unavailable; fallback stop used"
+        )
+
+    # ATR sanity checks
+    atr_pct = atr / current if current else 0.0
+    if atr_pct < min_atr_pct:
+        # ATR too tiny => targets/stops become meaningless
+        stop = max(0.01, current * (1 - max(max_down_pct, min_stop_pct)))
+        return ForecastResult(
+            predicted_price=current,
+            target_price=current,
+            stop_loss=stop,
+            atr=float(atr),
+            trend=trend,
+            reason=f"ATR too small ({atr_pct:.2%}); fallback used"
+        )
+
+    if atr_pct > max_atr_pct:
+        # ATR too huge => clamp hard to prevent nonsense
+        # We'll still return a forecast, but the reason makes it obvious.
+        atr = current * max_atr_pct
+        atr_pct = max_atr_pct
+
+    k, m = _score_to_multipliers(int(score))
+
+    # Trend bias (small nudges)
+    if trend == "up":
+        k *= 1.10
+    elif trend == "down":
+        k *= 0.85
+        m *= 1.10
+
+    predicted = current + (k * atr)
+    target = current + ((k + 0.30) * atr)
+    stop = current - (m * atr)
+
+    # Safety clamps
+    predicted = min(predicted, current * (1 + max_up_pct))
+    target = min(target, current * (1 + max_up_pct))
+
+    # Ensure stop is not too tight (and not beyond max_down clamp)
+    # Ensure stop is within [stop_floor, stop_min_dist]
+    stop_floor = current * (1 - max_down_pct)  # can't be worse than this
+    stop_min_dist = current * (1 - min_stop_pct)  # must be at least this far away
+
+    low = min(stop_floor, stop_min_dist)
+    high = max(stop_floor, stop_min_dist)
+
+    stop = max(stop, low)
+    stop = min(stop, high)
+
+    # Final sanity
+    predicted = max(0.01, _safe_float(predicted, current))
+    target = max(0.01, _safe_float(target, current))
+    stop = max(0.01, _safe_float(stop, current * 0.97))
+
+    # If somehow stop >= current, force it to min distance
+    if stop >= current:
+        stop = max(0.01, current * (1 - min_stop_pct))
+
+    reason = (
+        f"ATR(14)={atr:.4f} ({atr_pct:.2%}), trend={trend}, "
+        f"k={k:.2f}, m={m:.2f}, clamp=+{max_up_pct:.0%}/-{max_down_pct:.0%}, "
+        f"min_stop={min_stop_pct:.0%}"
+    )
+
+    return ForecastResult(
+        predicted_price=float(predicted),
+        target_price=float(target),
+        stop_loss=float(stop),
+        atr=float(atr),
+        trend=trend,
+        reason=reason
+    )

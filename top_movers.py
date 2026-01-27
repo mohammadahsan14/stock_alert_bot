@@ -7,24 +7,31 @@ import contextlib
 import io
 from io import StringIO
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import requests
 import yfinance as yf
 
-TOP_N = 50  # default top movers to track
+from config import APP_ENV, TOP_N  # single source of truth
 
-OUTPUT_DIR = "outputs"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-TICKER_CACHE_PATH = os.path.join(OUTPUT_DIR, "sp500_tickers_cache.csv")
+# -----------------------------
+# Cache location (env-aware)
+# outputs/<env>/sp500_tickers_cache.csv
+# -----------------------------
+BASE_DIR = Path(__file__).resolve().parent
+CACHE_DIR = BASE_DIR / "outputs" / APP_ENV
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+TICKER_CACHE_PATH = str(CACHE_DIR / "sp500_tickers_cache.csv")
 TICKER_CACHE_MAX_AGE_HOURS = 24
 
 
 def _cache_is_fresh(path: str, max_age_hours: int) -> bool:
     if not os.path.exists(path):
         return False
-    mtime = datetime.fromtimestamp(os.path.getmtime(path))
-    return (datetime.now() - mtime) <= timedelta(hours=max_age_hours)
+    mtime_utc = datetime.utcfromtimestamp(os.path.getmtime(path))
+    return (datetime.utcnow() - mtime_utc) <= timedelta(hours=max_age_hours)
 
 
 def fetch_sp500_tickers() -> list[str]:
@@ -93,10 +100,6 @@ def fetch_sp500_tickers() -> list[str]:
 
 @contextlib.contextmanager
 def _silence_yfinance_noise():
-    """
-    yfinance sometimes prints 'Failed download' messages directly to stdout/stderr.
-    This context manager silences that noise so your scheduler logs stay clean.
-    """
     buf_out = io.StringIO()
     buf_err = io.StringIO()
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
@@ -104,22 +107,13 @@ def _silence_yfinance_noise():
 
 
 def _get_ticker_df(download_df: pd.DataFrame, symbol: str, batch_len: int) -> pd.DataFrame:
-    """
-    yfinance can return:
-      - Single ticker: columns = Open/High/Low/Close/Adj Close/Volume
-      - Multi ticker: columns can be MultiIndex or grouped by ticker.
-    This helper returns a clean OHLCV df for a single symbol or empty df if missing.
-    """
     if download_df is None or not isinstance(download_df, pd.DataFrame) or download_df.empty:
         return pd.DataFrame()
 
-    # Single ticker request often returns a flat df
     if batch_len == 1 and all(col in download_df.columns for col in ["Open", "High", "Low", "Close"]):
         return download_df.copy()
 
-    # MultiIndex case: try both shapes
     if isinstance(download_df.columns, pd.MultiIndex):
-        # try (symbol, field)
         try:
             part = download_df[symbol].copy()
             if isinstance(part, pd.DataFrame) and "Close" in part.columns:
@@ -127,7 +121,6 @@ def _get_ticker_df(download_df: pd.DataFrame, symbol: str, batch_len: int) -> pd
         except Exception:
             pass
 
-        # try (field, symbol) -> swap levels
         try:
             swapped = download_df.swaplevel(axis=1)
             part = swapped[symbol].copy()
@@ -136,7 +129,6 @@ def _get_ticker_df(download_df: pd.DataFrame, symbol: str, batch_len: int) -> pd
         except Exception:
             pass
 
-    # Non-multiindex but still batched sometimes
     try:
         part = download_df[symbol].copy()
         if isinstance(part, pd.DataFrame) and "Close" in part.columns:
@@ -150,14 +142,10 @@ def _get_ticker_df(download_df: pd.DataFrame, symbol: str, batch_len: int) -> pd
 def _safe_last_close_series(ticker_df: pd.DataFrame) -> pd.Series:
     if ticker_df is None or ticker_df.empty or "Close" not in ticker_df.columns:
         return pd.Series(dtype="float64")
-    s = pd.to_numeric(ticker_df["Close"], errors="coerce").dropna()
-    return s
+    return pd.to_numeric(ticker_df["Close"], errors="coerce").dropna()
 
 
 def _download_batch(batch: list[str], max_retries: int = 3) -> pd.DataFrame:
-    """
-    Attempt to download a batch. Returns DataFrame or empty DataFrame on failure.
-    """
     attempt = 0
     last_df = pd.DataFrame()
 
@@ -169,7 +157,7 @@ def _download_batch(batch: list[str], max_retries: int = 3) -> pd.DataFrame:
                     period="30d",
                     group_by="ticker",
                     progress=False,
-                    threads=False,      # keep stable; threads=True sometimes triggers weirdness
+                    threads=False,
                     auto_adjust=False,
                 )
             if isinstance(df, pd.DataFrame) and not df.empty:
@@ -185,9 +173,6 @@ def _download_batch(batch: list[str], max_retries: int = 3) -> pd.DataFrame:
 
 
 def _download_single(symbol: str) -> pd.DataFrame:
-    """
-    Safe single-ticker download fallback.
-    """
     try:
         with _silence_yfinance_noise():
             df = yf.download(
@@ -202,49 +187,56 @@ def _download_single(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def calculate_top_movers(tickers: list[str], top_n: int = TOP_N) -> list[dict]:
+def calculate_top_movers(tickers: list[str], top_n: int | None = None) -> list[dict]:
     """
     Computes movers using last two trading closes (not calendar days).
-    Also computes 5-day and 20-day changes when enough history exists.
+    Adds basic telemetry so you can trust "empty" days.
     """
+    if top_n is None:
+        top_n = TOP_N
+
     all_movers: list[dict] = []
     batch_size = 50
     max_retries = 3
 
+    # telemetry
+    total_symbols = 0
+    skipped_no_data = 0
+    skipped_bad_prev = 0
+    used_single_fallback = 0
+
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
+        total_symbols += len(batch)
 
         df = _download_batch(batch, max_retries=max_retries)
-
-        # If batch is empty, fall back per ticker for this batch
-        use_single_fallback = (not isinstance(df, pd.DataFrame)) or df.empty
+        use_single = (not isinstance(df, pd.DataFrame)) or df.empty
+        if use_single:
+            used_single_fallback += len(batch)
 
         for symbol in batch:
             try:
-                if use_single_fallback:
-                    ticker_df = _download_single(symbol)
-                else:
-                    ticker_df = _get_ticker_df(df, symbol, batch_len=len(batch))
-
+                ticker_df = _download_single(symbol) if use_single else _get_ticker_df(df, symbol, batch_len=len(batch))
                 close = _safe_last_close_series(ticker_df)
+
                 if close.empty or len(close) < 2:
+                    skipped_no_data += 1
                     continue
 
                 close_today = float(close.iloc[-1])
                 close_prev = float(close.iloc[-2])
                 if close_prev == 0:
+                    skipped_bad_prev += 1
                     continue
 
                 pct_change_day = ((close_today - close_prev) / close_prev) * 100
 
-                # 5 trading days back (if available)
                 if len(close) >= 6:
                     close_5 = float(close.iloc[-6])
                     pct_change_week = ((close_today - close_5) / close_5) * 100 if close_5 else 0.0
                 else:
                     pct_change_week = 0.0
 
-                # 20 trading days back (if available)
                 if len(close) >= 21:
                     close_20 = float(close.iloc[-21])
                     pct_change_month = ((close_today - close_20) / close_20) * 100 if close_20 else 0.0
@@ -284,8 +276,15 @@ def calculate_top_movers(tickers: list[str], top_n: int = TOP_N) -> list[dict]:
                 })
 
             except Exception:
-                # swallow per-symbol failures; keep bot running
+                skipped_no_data += 1
                 continue
 
     all_movers.sort(key=lambda x: abs(x.get("pct_change", 0.0)), reverse=True)
-    return all_movers[:top_n]
+    movers = all_movers[:top_n]
+
+    print(
+        f"📊 movers telemetry | total={total_symbols} movers={len(all_movers)} "
+        f"top_n={top_n} skip_no_data={skipped_no_data} skip_bad_prev={skipped_bad_prev} "
+        f"single_fallback_used_for={used_single_fallback}"
+    )
+    return movers
