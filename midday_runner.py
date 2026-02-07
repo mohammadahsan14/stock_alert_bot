@@ -587,7 +587,7 @@ def run_midday(now: datetime | None = None) -> None:
 
         conf = compute_confidence(score_val, pct_change, market_trend, flag)
 
-        f = forecast_price_levels(sym, current=current, score=score_val)
+        f = forecast_price_levels(sym, current=current, score=score_val, horizon="intraday")
 
         raw_pred = _safe_float(getattr(f, "predicted_price", None))
         raw_tgt = _safe_float(getattr(f, "target_price", None))

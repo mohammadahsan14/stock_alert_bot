@@ -470,7 +470,7 @@ def run_premarket(now: datetime | None = None) -> None:
 
         conf = compute_confidence(score_val, pct_change, market_trend, flag)
 
-        f = forecast_price_levels(sym, current=current, score=score_val)
+        f = forecast_price_levels(sym, current=current, score=score_val, horizon="intraday")
         price_cat = get_price_category(current)
 
         rows.append({
