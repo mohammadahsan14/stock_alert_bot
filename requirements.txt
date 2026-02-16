@@ -8,3 +8,4 @@ python-dotenv>=1.0
 schedule>=1.2.0
 lxml>=4.9
 resend
+openai>=1.30,<2.0
