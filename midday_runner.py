@@ -1,5 +1,7 @@
-# midday_runner.py (FINAL - robust target/stop sanity + safe midday scaling + debug artifacts)
+# midday_runner.py (FINAL LOCK + FINAL_VIEW + HIGH-VOTE FALLBACK + DETERMINISTIC PLAN_CARD + DAILY_LOG TRUTH)
 from __future__ import annotations
+
+from llm.explain import safe_explain_pick
 
 import os
 import re
@@ -56,6 +58,14 @@ MIDDAY_MIN_CONFIDENCE = int(os.getenv("MIDDAY_MIN_CONFIDENCE", "5"))
 FORECAST_TARGET_MAX_MULT = float(os.getenv("FORECAST_TARGET_MAX_MULT", "1.20"))  # target <= 20% above entry
 FORECAST_STOP_MIN_MULT   = float(os.getenv("FORECAST_STOP_MIN_MULT", "0.80"))    # stop  >= 80% of entry
 
+# LLM controls
+LLM_ENABLED = os.getenv("LLM_ENABLED", "1") == "1"
+MIDDAY_LLM_TOP_N = int(os.getenv("MIDDAY_LLM_TOP_N", "10"))
+
+# FINAL view controls
+FINAL_VIEW_TOP_N = int(os.getenv("FINAL_VIEW_TOP_N", "3"))
+CONF_GATE = int(os.getenv("CONF_GATE", str(MIDDAY_MIN_CONFIDENCE)))
+
 
 # -----------------------------
 # Output helpers (env-aware)
@@ -96,6 +106,12 @@ def ensure_csv_exists(path: str, header_cols: list[str]) -> None:
 
 def make_run_id(now: datetime) -> str:
     return now.strftime("%Y%m%d_%H%M%S")
+
+
+def _midday_email_marker(now: datetime) -> Path:
+    d = run_dir(now, "midday")
+    run_date = now.strftime("%Y-%m-%d")
+    return d / f"email_sent_{run_date}.txt"
 
 
 # -----------------------------
@@ -160,6 +176,7 @@ def style_excel_sheet(sheet) -> None:
 def write_midday_excel(
     excel_path: str,
     *,
+    final_view_df: pd.DataFrame,
     pass_df: pd.DataFrame,
     all_df: pd.DataFrame,
     threshold_df: pd.DataFrame,
@@ -170,6 +187,7 @@ def write_midday_excel(
         p.parent.mkdir(parents=True, exist_ok=True)
 
         with pd.ExcelWriter(excel_path, engine="openpyxl") as xw:
+            (final_view_df if final_view_df is not None else pd.DataFrame()).to_excel(xw, sheet_name="FINAL_VIEW", index=False)
             (pass_df if pass_df is not None else pd.DataFrame()).to_excel(xw, sheet_name="PASS", index=False)
             (all_df if all_df is not None else pd.DataFrame()).to_excel(xw, sheet_name="ALL_CANDIDATES", index=False)
             (threshold_df if threshold_df is not None else pd.DataFrame()).to_excel(xw, sheet_name="AFTER_THRESHOLD", index=False)
@@ -181,6 +199,208 @@ def write_midday_excel(
 
     except Exception as e:
         (Path(rf) / "midday_excel_error.txt").write_text(repr(e), encoding="utf-8")
+
+
+# -----------------------------
+# LLM helpers
+# -----------------------------
+def _ensure_llm_col(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy() if df is not None else pd.DataFrame()
+    if "llm_explanation" not in df.columns:
+        df["llm_explanation"] = ""
+    return df
+
+
+def _llm_num_or_np(x) -> float | str:
+    try:
+        v = float(pd.to_numeric(x, errors="coerce"))
+        return v if v > 0 else "not provided"
+    except Exception:
+        return "not provided"
+
+
+def _apply_llm_explanations(df: pd.DataFrame, *, horizon: str, top_n: int | None) -> pd.DataFrame:
+    df = _ensure_llm_col(df)
+    if not LLM_ENABLED or df.empty:
+        return df
+
+    n = len(df) if top_n is None else min(int(top_n), len(df))
+    idx = df.head(n).index
+
+    def _row_payload(r: pd.Series) -> dict:
+        return {
+            "symbol": str(r.get("symbol", "")).upper().strip(),
+            "decision": str(r.get("decision", "")),
+            "score": int(pd.to_numeric(r.get("score"), errors="coerce") or 0),
+            "confidence": int(pd.to_numeric(r.get("confidence"), errors="coerce") or 0),
+            "pct_change": float(pd.to_numeric(r.get("pct_change"), errors="coerce") or 0.0),
+
+            "current": _llm_num_or_np(r.get("current")),
+            "predicted_price": _llm_num_or_np(r.get("predicted_price")),
+            "target_price": _llm_num_or_np(r.get("target_price")),
+            "stop_loss": _llm_num_or_np(r.get("stop_loss")),
+            "forecast_atr": _llm_num_or_np(r.get("forecast_atr")),
+
+            "forecast_trend": str(r.get("forecast_trend") or ""),
+            "forecast_reason": str(r.get("forecast_reason") or ""),
+
+            "news_flag": str(r.get("news_flag") or ""),
+            "main_news_title": str(r.get("main_news_title") or ""),
+            "reasons": str(r.get("reasons") or ""),
+
+            "horizon": horizon,
+            "position_size_usd": float(os.getenv("DEFAULT_POSITION_SIZE_USD", "0") or 0) or "not provided",
+            "holding_window": "intraday",
+            "conf_gate": CONF_GATE,
+        }
+
+    df.loc[idx, "llm_explanation"] = df.loc[idx].apply(
+        lambda r: str(safe_explain_pick(_row_payload(r)) or "").strip(),
+        axis=1
+    )
+    return df
+
+
+# -----------------------------
+# Deterministic Plan Card (LOCKED FORMAT)
+# -----------------------------
+def _safe_float(x) -> Optional[float]:
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _entry_range(cur: Optional[float], atr: Optional[float]) -> tuple[Optional[float], Optional[float]]:
+    if cur is None or cur <= 0:
+        return None, None
+    if atr is None or atr <= 0:
+        lo = cur * 0.9925
+        hi = cur * 1.0075
+        return lo, hi
+    lo = cur - 0.35 * atr
+    hi = cur + 0.35 * atr
+    return lo, hi
+
+
+def _time_window_bucket(conf: int, trend: str) -> str:
+    trend = (trend or "").lower()
+    if conf >= 7 and trend == "up":
+        return "2–3 days"
+    if conf >= 6:
+        return "1–2 days"
+    return "day"
+
+
+def _plan_card_row(r: pd.Series) -> str:
+    cur = _safe_float(r.get("current"))
+    tgt = _safe_float(r.get("target_price"))
+    stp = _safe_float(r.get("stop_loss"))
+    atr = _safe_float(r.get("forecast_atr"))
+    conf = int(pd.to_numeric(r.get("confidence"), errors="coerce") or 0)
+    trend = str(r.get("forecast_trend") or "")
+
+    lo, hi = _entry_range(cur, atr)
+    tw = _time_window_bucket(conf, trend)
+
+    def m(x):
+        return "" if x is None else f"{x:.2f}"
+
+    pl_up = pl_dn = rr = None
+    up_pct = dn_pct = None
+
+    if cur and tgt and stp and cur > 0:
+        pl_up = tgt - cur
+        pl_dn = stp - cur
+        up_pct = (pl_up / cur) * 100.0
+        dn_pct = (pl_dn / cur) * 100.0
+        risk = abs(pl_dn)
+        rr = (pl_up / risk) if risk > 0 else None
+
+    return "\n".join([
+        f"• Entry range: ${m(lo)}–${m(hi)} (cur ${m(cur)})" if (lo is not None and hi is not None) else f"• Entry range: not provided (cur ${m(cur)})",
+        f"• Time window: {tw}",
+        f"• Levels: target ${m(tgt)} | stop ${m(stp)}",
+        f"• P/L: +${m(pl_up)} ({m(up_pct)}%) | ${m(pl_dn)} ({m(dn_pct)}%) | R:R {m(rr)}" if rr is not None else "• P/L: not provided",
+        f"• Stance reason: conf {r.get('confidence')} vs gate {CONF_GATE} | news {r.get('news_flag')}",
+    ])
+
+
+# -----------------------------
+# FINAL_VIEW builder
+# -----------------------------
+def _vote_score(r: pd.Series) -> int:
+    score = 0
+    conf = pd.to_numeric(r.get("confidence"), errors="coerce")
+    scr = pd.to_numeric(r.get("score"), errors="coerce")
+    pct = pd.to_numeric(r.get("pct_change"), errors="coerce")
+    trend = str(r.get("forecast_trend") or "").lower()
+    news = str(r.get("news_flag") or "")
+
+    if pd.notna(conf) and int(conf) >= 6:
+        score += 3
+    if pd.notna(scr) and float(scr) >= 60:
+        score += 2
+    if pd.notna(pct) and abs(float(pct)) >= 3.0:
+        score += 1
+    if trend == "up":
+        score += 1
+
+    if news == "🔴":
+        score -= 2
+    elif news == "🟡":
+        score -= 1
+
+    return int(score)
+
+
+def _build_final_view(pass_df: pd.DataFrame, all_df: pd.DataFrame) -> pd.DataFrame:
+    cols_min = [
+        "symbol", "current", "pct_change",
+        "predicted_price", "target_price", "stop_loss",
+        "forecast_trend", "forecast_atr", "forecast_reason",
+        "score", "score_label", "confidence", "decision",
+        "news_flag", "main_news_title", "main_news_link",
+        "reasons", "llm_explanation",
+    ]
+
+    def _ensure(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy() if df is not None else pd.DataFrame()
+        for c in cols_min:
+            if c not in df.columns:
+                df[c] = pd.NA
+        return df
+
+    pass_df = _ensure(pass_df)
+    all_df = _ensure(all_df)
+
+    if not pass_df.empty:
+        final = pass_df.head(FINAL_VIEW_TOP_N).copy()
+        final["stance"] = "GO"
+        final["stance_reason"] = final.apply(
+            lambda r: f"conf {r.get('confidence')} vs gate {CONF_GATE} | news {r.get('news_flag')}",
+            axis=1
+        )
+        return final.reset_index(drop=True)
+
+    if all_df.empty:
+        return pd.DataFrame(columns=cols_min + ["stance", "stance_reason", "vote_score", "plan_card"])
+
+    tmp = all_df.dropna(subset=["symbol"]).copy()
+    tmp["symbol"] = tmp["symbol"].astype(str).str.upper().str.strip()
+    tmp = tmp.drop_duplicates(subset=["symbol"])
+    tmp["vote_score"] = tmp.apply(_vote_score, axis=1)
+    tmp = tmp.sort_values(by=["vote_score", "confidence", "score"], ascending=False)
+
+    final = tmp.head(FINAL_VIEW_TOP_N).copy()
+    final["stance"] = "WATCH"
+    final["stance_reason"] = final.apply(
+        lambda r: f"conf {r.get('confidence')} vs gate {CONF_GATE} | vote {r.get('vote_score')} | news {r.get('news_flag')}",
+        axis=1
+    )
+    return final.reset_index(drop=True)
 
 
 # -----------------------------
@@ -248,7 +468,7 @@ def get_market_snapshot() -> dict:
 
 def compute_confidence(score_val: int, pct_change: float, market_trend: str, news_flag: str) -> int:
     score_val = max(0, min(int(score_val), 100))
-    base = round((score_val / 100.0) * 10.0)  # 0..10
+    base = round((score_val / 100.0) * 10.0)
 
     move = min(abs(float(pct_change or 0.0)), 8.0)
     vol_penalty = 2 if move >= 6 else (1 if move >= 4 else 0)
@@ -260,15 +480,6 @@ def compute_confidence(score_val: int, pct_change: float, market_trend: str, new
     return max(1, min(conf, 10))
 
 
-def _safe_float(x) -> Optional[float]:
-    try:
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
 def _default_target_stop(entry: float, conf: int) -> tuple[float, float]:
     conf = int(conf) if conf is not None else 5
     tgt_pct = 0.015 if conf >= 7 else (0.012 if conf >= 6 else 0.01)
@@ -276,9 +487,16 @@ def _default_target_stop(entry: float, conf: int) -> tuple[float, float]:
     return entry * (1.0 + tgt_pct), entry * (1.0 - stp_pct)
 
 
-def _sanitize_forecast_levels(entry: float, conf: int, pred: Optional[float], tgt: Optional[float], stp: Optional[float]) -> tuple[Optional[float], float, float]:
+def _sanitize_forecast_levels(
+    entry: float,
+    conf: int,
+    pred: Optional[float],
+    tgt: Optional[float],
+    stp: Optional[float],
+) -> tuple[Optional[float], float, float]:
     if entry is None or entry <= 0:
-        return pred, tgt if tgt is not None else pd.NA, stp if stp is not None else pd.NA
+        dt, ds = _default_target_stop(1.0, conf)
+        return pred, float(tgt) if tgt is not None else dt, float(stp) if stp is not None else ds
 
     if tgt is not None and tgt <= entry:
         tgt = None
@@ -321,49 +539,18 @@ def _time_scaled_target_stop(entry: float, base_target: float, base_stop: float,
     stp_pct_scaled = min(max(stp_pct_scaled, 0.004), 0.03)
 
     new_target = entry * (1.0 + tgt_pct_scaled)
-    new_stop   = entry * (1.0 - stp_pct_scaled)
+    new_stop = entry * (1.0 - stp_pct_scaled)
     return float(new_target), float(new_stop)
 
 
-def _infer_intraday_target_stop(row: pd.Series) -> tuple[Optional[float], Optional[float]]:
-    entry = _safe_float(row.get("current") if "current" in row else row.get("entry_price"))
-    tgt = _safe_float(row.get("target_price"))
-    stp = _safe_float(row.get("stop_loss"))
+# -----------------------------
+# Email builder (FINAL_VIEW)
+# -----------------------------
+def build_midday_alert(final_view_df: pd.DataFrame, run_date: str) -> str:
+    if final_view_df is None or final_view_df.empty:
+        return f"<h2>⚡ Midday Sudden Movers ({run_date})</h2><p>No qualified picks or watchlist today.</p>"
 
-    if tgt is None:
-        tgt = _safe_float(row.get("predicted_price"))
-
-    if entry is not None and entry > 0:
-        if tgt is not None and tgt <= entry:
-            tgt = None
-        if stp is not None and stp >= entry:
-            stp = None
-
-        conf = int(pd.to_numeric(row.get("confidence"), errors="coerce") or 5)
-        if tgt is None or stp is None:
-            dt, ds = _default_target_stop(entry, conf)
-            if tgt is None:
-                tgt = dt
-            if stp is None:
-                stp = ds
-
-    return tgt, stp
-
-
-def build_midday_alert(df: pd.DataFrame, run_date: str) -> str:
-    if df is None or df.empty:
-        return f"<h2>⚡ Midday Sudden Movers ({run_date})</h2><p>No candidates passed filters.</p>"
-
-    cols = [
-        "symbol", "current", "pct_change",
-        "predicted_price", "target_price", "stop_loss",
-        "score", "confidence", "decision",
-        "main_news_title", "main_news_link", "reasons",
-    ]
-    df2 = df.copy()
-    for c in cols:
-        if c not in df2.columns:
-            df2[c] = ""
+    df2 = final_view_df.copy()
 
     def _fmt_money(x):
         try:
@@ -382,20 +569,24 @@ def build_midday_alert(df: pd.DataFrame, run_date: str) -> str:
             return ""
 
     def row_html(r):
-        sym = _html.escape(str(r["symbol"]))
-        cur = _fmt_money(r["current"])
-        pct = _fmt_pct(r["pct_change"])
-
+        sym = _html.escape(str(r.get("symbol", "")))
+        cur = _fmt_money(r.get("current"))
+        pct = _fmt_pct(r.get("pct_change"))
         pred = _fmt_money(r.get("predicted_price"))
         tgt = _fmt_money(r.get("target_price"))
         stp = _fmt_money(r.get("stop_loss"))
 
-        score = str(r["score"])
-        conf = str(r["confidence"])
-        dec = _html.escape(str(r["decision"]))
-        title = _html.escape(str(r["main_news_title"] or ""))
-        link = str(r["main_news_link"] or "").strip() or "#"
-        reasons = _html.escape(str(r["reasons"] or ""))[:600]
+        score = _html.escape(str(r.get("score", "")))
+        conf = _html.escape(str(r.get("confidence", "")))
+        stance = _html.escape(str(r.get("stance", "")))
+        stance_reason = _html.escape(str(r.get("stance_reason", "")))
+
+        title = _html.escape(str(r.get("main_news_title") or ""))
+        link = str(r.get("main_news_link") or "").strip() or "#"
+        reasons = _html.escape(str(r.get("reasons") or ""))[:400]
+
+        plan = _html.escape(str(r.get("plan_card") or ""))[:900].replace("\n", "<br>")
+
         return f"""
         <tr>
           <td><b>{sym}</b></td>
@@ -406,22 +597,26 @@ def build_midday_alert(df: pd.DataFrame, run_date: str) -> str:
           <td>{stp}</td>
           <td>{score}</td>
           <td>{conf}</td>
-          <td>{dec}</td>
+          <td>{stance}<br><span style="color:#666;font-size:11px;">{stance_reason}</span></td>
           <td><a href="{link}" target="_blank">{title}</a></td>
           <td style="color:#444;">{reasons}</td>
+          <td style="color:#222;">{plan}</td>
         </tr>
         """
 
     rows = "\n".join([row_html(r) for _, r in df2.iterrows()])
+    mode_note = "Qualified Picks (GO)" if (df2.get("stance") == "GO").any() else "High Vote Watchlist (WATCH)"
 
     return f"""
     <h2>⚡ Midday Sudden Movers ({run_date})</h2>
+    <p><b>Mode:</b> {mode_note}</p>
     <p>Filters: abs(move)≥{SUDDEN_MOVER_PCT_THRESHOLD}%, conf≥{MIDDAY_MIN_CONFIDENCE}, price≤${MAX_PRICE} (elite override allowed).</p>
     <p><b>Win rule (postmarket):</b> target hit anytime after recommendation (intraday high ≥ target).</p>
+
     <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial;font-size:13px;">
       <tr style="background:#eee;">
         <th>Symbol</th><th>Price</th><th>%</th><th>Pred</th><th>Target</th><th>Stop</th>
-        <th>Score</th><th>Conf</th><th>Decision</th><th>Headline</th><th>Reasons</th>
+        <th>Score</th><th>Conf</th><th>Stance</th><th>Headline</th><th>Reasons</th><th>Plan Card (Locked)</th>
       </tr>
       {rows}
     </table>
@@ -467,7 +662,7 @@ def append_recommendations_log(df_reco: pd.DataFrame, now: datetime, mode: str) 
         if c not in out.columns:
             out[c] = pd.NA
 
-    for c in ["predicted_price", "target_price", "stop_loss"]:
+    for c in ["current", "pct_change", "predicted_price", "target_price", "stop_loss", "forecast_atr"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
@@ -476,9 +671,6 @@ def append_recommendations_log(df_reco: pd.DataFrame, now: datetime, mode: str) 
     out.to_csv(RECO_LOG_CSV, mode="a", header=not file_exists, index=False)
 
 
-# -----------------------------
-# DAILY Picks log (for postmarket evaluation)
-# -----------------------------
 DAILY_LOG_CSV = out_path("daily_stock_log.csv", kind="logs")
 ensure_csv_exists(DAILY_LOG_CSV, [
     "run_date", "mode", "symbol", "price_category",
@@ -486,8 +678,52 @@ ensure_csv_exists(DAILY_LOG_CSV, [
     "forecast_trend", "forecast_atr", "forecast_reason",
     "trade_plan", "earnings_risk",
     "decision", "score", "score_label", "confidence",
-    "reasons", "news_flag", "main_news_title", "main_news_link",
+    "reasons", "llm_explanation", "news_flag", "main_news_title", "main_news_link",
 ])
+
+
+def append_daily_log(final_view_df: pd.DataFrame, now: datetime, mode: str) -> None:
+    """
+    Source-of-truth log for postmarket evaluation.
+    Writes FINAL_VIEW rows (GO + WATCH) with stable schema (one row per symbol per day+mode).
+    """
+    if final_view_df is None or final_view_df.empty:
+        return
+
+    run_date = now.strftime("%Y-%m-%d")
+
+    cols = [
+        "run_date", "mode", "symbol", "price_category",
+        "current", "predicted_price", "target_price", "stop_loss",
+        "forecast_trend", "forecast_atr", "forecast_reason",
+        "trade_plan", "earnings_risk",
+        "decision", "score", "score_label", "confidence",
+        "reasons", "llm_explanation", "news_flag", "main_news_title", "main_news_link",
+    ]
+
+    out = final_view_df.copy()
+    out["run_date"] = run_date
+    out["mode"] = mode
+
+    for c in cols:
+        if c not in out.columns:
+            out[c] = pd.NA
+    out = out[cols]
+
+    for c in ["current", "predicted_price", "target_price", "stop_loss", "forecast_atr"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    existing = (
+        pd.read_csv(DAILY_LOG_CSV)
+        if (os.path.exists(DAILY_LOG_CSV) and os.path.getsize(DAILY_LOG_CSV) > 0)
+        else pd.DataFrame(columns=cols)
+    )
+    existing = existing.reindex(columns=cols)
+
+    merged = pd.concat([existing, out], ignore_index=True)
+    merged["symbol"] = merged["symbol"].astype(str).str.upper().str.strip()
+    merged = merged.drop_duplicates(subset=["run_date", "mode", "symbol"], keep="last")
+    merged.to_csv(DAILY_LOG_CSV, index=False)
 
 
 # -----------------------------
@@ -496,22 +732,21 @@ ensure_csv_exists(DAILY_LOG_CSV, [
 def run_midday(now: datetime | None = None) -> None:
     now = now or datetime.now(LOCAL_TZ)
 
-    # ✅ Guard: only run during market session window
-    # Skip only in non-local environments (prod / DigitalOcean)
     if now.time() < SESSION_START and not IS_LOCAL:
         print("⛔ Midday runner skipped: market not open yet.")
         return
-
     if now.time() >= SESSION_END and not IS_LOCAL:
         print("⛔ Midday runner skipped: market already closed.")
         return
-
 
     mode = "midday"
     rf = run_dir(now, mode)
     run_date = now.strftime("%Y-%m-%d")
 
-    empty_note = Path(rf) / "empty_midday.txt"
+    marker = _midday_email_marker(now)
+    if marker.exists():
+        print("📩 Midday email already sent for this run_date — skipping resend.")
+        return
 
     tickers = fetch_sp500_tickers()
     movers = calculate_top_movers(tickers, top_n=TOP_N)
@@ -523,16 +758,17 @@ def run_midday(now: datetime | None = None) -> None:
     )
 
     if raw_df.empty or "pct_change" not in raw_df.columns:
-        raw_df.to_csv(Path(rf) / "midday_raw_movers.csv", index=False)
         write_midday_excel(
             excel_path,
+            final_view_df=pd.DataFrame(),
             pass_df=pd.DataFrame(),
             all_df=pd.DataFrame(),
             threshold_df=pd.DataFrame(),
             rf=Path(rf),
         )
         html = f"<h2>⚡ Midday Sudden Movers ({run_date})</h2><p>No movers returned.</p>"
-        send_email(f"⚡ Sudden Movers Alert ({run_date})", html, attachment_path=excel_path)
+        if send_email(f"⚡ Sudden Movers Alert ({run_date})", html, attachment_path=excel_path):
+            marker.write_text("sent\n", encoding="utf-8")
         return
 
     raw_df["pct_change"] = pd.to_numeric(raw_df["pct_change"], errors="coerce").fillna(0.0)
@@ -542,12 +778,9 @@ def run_midday(now: datetime | None = None) -> None:
     thr_df.to_csv(Path(rf) / "midday_after_threshold.csv", index=False)
 
     if thr_df.empty:
-        empty_note.write_text(
-            f"No movers exceeded threshold {SUDDEN_MOVER_PCT_THRESHOLD}%. raw_movers={len(raw_df)}",
-            encoding="utf-8",
-        )
         write_midday_excel(
             excel_path,
+            final_view_df=pd.DataFrame(),
             pass_df=pd.DataFrame(),
             all_df=pd.DataFrame(),
             threshold_df=thr_df,
@@ -556,9 +789,10 @@ def run_midday(now: datetime | None = None) -> None:
         html = f"""
         <h2>⚡ Midday Sudden Movers ({run_date})</h2>
         <p>No movers exceeded threshold {SUDDEN_MOVER_PCT_THRESHOLD}%.</p>
-        <p><b>Attachment:</b> Excel included with sheets: PASS (empty), ALL_CANDIDATES, AFTER_THRESHOLD.</p>
+        <p><b>Attachment:</b> Excel included with sheets: FINAL_VIEW (empty), PASS (empty), ALL_CANDIDATES, AFTER_THRESHOLD.</p>
         """
-        send_email(f"⚡ Sudden Movers Alert ({run_date})", html, attachment_path=excel_path)
+        if send_email(f"⚡ Sudden Movers Alert ({run_date})", html, attachment_path=excel_path):
+            marker.write_text("sent\n", encoding="utf-8")
         return
 
     snapshot = get_market_snapshot()
@@ -566,8 +800,7 @@ def run_midday(now: datetime | None = None) -> None:
 
     scores, labels, reasons_list, confs, decisions = [], [], [], [], []
     titles, links, flags = [], [], []
-    preds, tgts, stps, ftrends, fatrs = [], [], [], [], []
-
+    preds, tgts, stps, ftrends, fatrs, freasons = [], [], [], [], [], []
     dbg_rows = []
 
     for _, row in thr_df.iterrows():
@@ -588,7 +821,6 @@ def run_midday(now: datetime | None = None) -> None:
         conf = compute_confidence(score_val, pct_change, market_trend, flag)
 
         f = forecast_price_levels(sym, current=current, score=score_val, horizon="intraday")
-
         raw_pred = _safe_float(getattr(f, "predicted_price", None))
         raw_tgt = _safe_float(getattr(f, "target_price", None))
         raw_stp = _safe_float(getattr(f, "stop_loss", None))
@@ -609,6 +841,7 @@ def run_midday(now: datetime | None = None) -> None:
         stps.append(stp_s if stp_s is not None else pd.NA)
         ftrends.append(str(getattr(f, "trend", "")))
         fatrs.append(float(getattr(f, "atr", pd.NA)) if getattr(f, "atr", None) is not None else pd.NA)
+        freasons.append(str(getattr(f, "reason", "")))
 
         if MIDDAY_DEBUG:
             dbg_rows.append({
@@ -637,8 +870,7 @@ def run_midday(now: datetime | None = None) -> None:
     all_df["stop_loss"] = pd.to_numeric(pd.Series(stps, index=all_df.index), errors="coerce")
     all_df["forecast_trend"] = ftrends
     all_df["forecast_atr"] = fatrs
-
-    all_df.sort_values(by=["confidence", "score"], ascending=False).to_csv(Path(rf) / "midday_candidates_all.csv", index=False)
+    all_df["forecast_reason"] = freasons
 
     pass_df = all_df[all_df["confidence"] >= MIDDAY_MIN_CONFIDENCE].copy()
     pass_df = pass_df[
@@ -646,11 +878,8 @@ def run_midday(now: datetime | None = None) -> None:
         ((pass_df["score"] >= ELITE_SCORE_OVERRIDE) & (pass_df["confidence"] >= ELITE_CONF_OVERRIDE))
     ].copy()
     pass_df = pass_df.sort_values(by=["confidence", "score"], ascending=False)
-    pass_df.to_csv(Path(rf) / "midday_candidates_pass.csv", index=False)
 
-    # -----------------------------
     # Midday target/stop scaling
-    # -----------------------------
     if not pass_df.empty:
         tgt_scaled, stp_scaled = [], []
         for _, r in pass_df.iterrows():
@@ -666,100 +895,65 @@ def run_midday(now: datetime | None = None) -> None:
                 tgt_scaled.append(base_tgt if base_tgt is not None else pd.NA)
                 stp_scaled.append(base_stp if base_stp is not None else pd.NA)
 
-        # ✅ FIX: align by index to prevent symbol-mixups
         pass_df["target_price"] = pd.to_numeric(pd.Series(tgt_scaled, index=pass_df.index), errors="coerce")
         pass_df["stop_loss"] = pd.to_numeric(pd.Series(stp_scaled, index=pass_df.index), errors="coerce")
 
-    # Hard sanity check before sending/logging
-    if not pass_df.empty:
-        cur_s = pd.to_numeric(pass_df["current"], errors="coerce")
-        tgt_s = pd.to_numeric(pass_df["target_price"], errors="coerce")
-        stp_s = pd.to_numeric(pass_df["stop_loss"], errors="coerce")
-        bad = pass_df[(tgt_s <= cur_s) | (stp_s >= cur_s)]
-        if not bad.empty:
-            bad.to_csv(Path(rf) / "bad_targets.csv", index=False)
+    # LLM explanations (optional; keep for Excel only)
+    pass_df = _apply_llm_explanations(pass_df, horizon="midday_pass", top_n=MIDDAY_LLM_TOP_N)
+    all_df = _apply_llm_explanations(all_df, horizon="midday_all_candidates", top_n=MIDDAY_LLM_TOP_N)
+
+    # FINAL_VIEW
+    final_view_df = _build_final_view(pass_df, all_df)
+
+    # FINAL_VIEW: deterministic plan_card always present
+    if not final_view_df.empty:
+        final_view_df["plan_card"] = final_view_df.apply(_plan_card_row, axis=1)
+    else:
+        final_view_df = final_view_df.copy()
+        final_view_df["plan_card"] = ""
+
+    # Optional: LLM for FINAL_VIEW only (kept but not required)
+    final_view_df = _apply_llm_explanations(final_view_df, horizon="midday_final_view", top_n=None)
 
     if MIDDAY_DEBUG and dbg_rows:
         pd.DataFrame(dbg_rows).to_csv(Path(rf) / "debug_forecast_sanity.csv", index=False)
 
-    append_recommendations_log(pass_df, now, mode="midday")
+    # Logs:
+    # - recommendations_log: PASS only (legacy)
+    pass_df_to_log = pass_df.copy()
+    if "llm_explanation" in pass_df_to_log.columns:
+        pass_df_to_log = pass_df_to_log.drop(columns=["llm_explanation"])
+    append_recommendations_log(pass_df_to_log, now, mode="midday")
 
-    # DAILY log (PASS only)
-    daily_cols = [
-        "run_date", "mode", "symbol", "price_category",
-        "current", "predicted_price", "target_price", "stop_loss",
-        "forecast_trend", "forecast_atr", "forecast_reason",
-        "trade_plan", "earnings_risk",
-        "decision", "score", "score_label", "confidence",
-        "reasons", "news_flag", "main_news_title", "main_news_link",
-    ]
+    # - daily_stock_log: FINAL_VIEW (truth for postmarket)
+    append_daily_log(final_view_df, now, mode="midday")
 
-    picks_log = pass_df.copy()
-    picks_log["run_date"] = run_date
-    picks_log["mode"] = "midday"
-
-    tgt_fix, stp_fix = [], []
-    for _, r in picks_log.iterrows():
-        tgt, stp = _infer_intraday_target_stop(r)
-        tgt_fix.append(tgt if tgt is not None else pd.NA)
-        stp_fix.append(stp if stp is not None else pd.NA)
-
-    # ✅ FIX: align by index to prevent symbol-mixups
-    picks_log["target_price"] = pd.to_numeric(pd.Series(tgt_fix, index=picks_log.index), errors="coerce")
-    picks_log["stop_loss"] = pd.to_numeric(pd.Series(stp_fix, index=picks_log.index), errors="coerce")
-
-    if "price_category" not in picks_log.columns:
-        picks_log["price_category"] = ""
-    if "forecast_reason" not in picks_log.columns:
-        picks_log["forecast_reason"] = ""
-    if "trade_plan" not in picks_log.columns:
-        picks_log["trade_plan"] = "Midday sudden mover; target-hit win tracking uses intraday high vs target."
-    if "earnings_risk" not in picks_log.columns:
-        picks_log["earnings_risk"] = ""
-
-    for c in daily_cols:
-        if c not in picks_log.columns:
-            picks_log[c] = ""
-
-    picks_log = picks_log[daily_cols]
-
-    existing = (
-        pd.read_csv(DAILY_LOG_CSV)
-        if (os.path.exists(DAILY_LOG_CSV) and os.path.getsize(DAILY_LOG_CSV) > 0)
-        else pd.DataFrame(columns=daily_cols)
-    )
-
-    if "mode" not in existing.columns:
-        existing["mode"] = ""
-
-    merged = pd.concat([existing, picks_log], ignore_index=True)
-    merged = merged.drop_duplicates(subset=["run_date", "mode", "symbol"], keep="last")
-    merged.to_csv(DAILY_LOG_CSV, index=False)
-
+    # Excel
     write_midday_excel(
         excel_path,
+        final_view_df=final_view_df,
         pass_df=pass_df,
         all_df=all_df,
         threshold_df=thr_df,
         rf=Path(rf),
     )
 
-    if pass_df.empty:
-        empty_note.write_text(
-            f"No candidates passed gates. conf>={MIDDAY_MIN_CONFIDENCE}, price<=${MAX_PRICE} unless elite.",
-            encoding="utf-8",
-        )
+    # Email always from FINAL_VIEW (deterministic plan_card)
+    if final_view_df.empty:
         html = f"""
         <h2>⚡ Midday Sudden Movers ({run_date})</h2>
-        <p>No candidates passed gates.</p>
-        <p><b>Attachment:</b> Excel included with sheets: PASS (empty), ALL_CANDIDATES, AFTER_THRESHOLD.</p>
+        <p>No qualified picks or watchlist today.</p>
+        <p><b>Attachment:</b> Excel included with sheets: FINAL_VIEW, PASS, ALL_CANDIDATES, AFTER_THRESHOLD.</p>
         """
-        send_email(f"⚡ Sudden Movers Alert ({run_date})", html, attachment_path=excel_path)
+        if send_email(f"⚡ Sudden Movers Alert ({run_date})", html, attachment_path=excel_path):
+            marker.write_text("sent\n", encoding="utf-8")
         return
 
-    html = build_midday_alert(pass_df, run_date)
-    send_email(f"⚡ Sudden Movers Alert ({run_date})", html, attachment_path=excel_path)
-    print(f"✅ Midday complete | sent={len(pass_df)} | threshold_rows={len(thr_df)}")
+    html = build_midday_alert(final_view_df, run_date)
+    if send_email(f"⚡ Sudden Movers Alert ({run_date})", html, attachment_path=excel_path):
+        marker.write_text("sent\n", encoding="utf-8")
+
+    print(f"✅ Midday complete | final_view={len(final_view_df)} | pass={len(pass_df)} | threshold_rows={len(thr_df)}")
 
 
 if __name__ == "__main__":

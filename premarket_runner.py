@@ -1,5 +1,7 @@
-# premarket_runner.py (FINAL LOCK VERSION)
+# premarket_runner.py (FINAL LOCK VERSION + FINAL_VIEW + HIGH-VOTE FALLBACK + ENRICHED RAW + DETERMINISTIC PLAN_CARD + LLM OPTIONAL)
 from __future__ import annotations
+
+from llm.explain import safe_explain_pick
 
 import os
 import re
@@ -47,6 +49,7 @@ from performance_tracker import (
     add_new_positions_from_picks,
     append_open_actions,
 )
+
 import warnings
 warnings.filterwarnings(
     "ignore",
@@ -58,6 +61,81 @@ LOCAL_TZ = ZoneInfo("America/Chicago")
 
 POS_WORDS = {"beat", "strong", "growth", "surge", "upgrade", "raises", "record", "profit", "wins", "bull"}
 NEG_WORDS = {"miss", "drop", "loss", "cuts", "downgrade", "falls", "weak", "lawsuit", "plunge", "bear"}
+
+# LLM flags
+PREMARKET_LLM_ENABLED = os.getenv("LLM_ENABLED", "1") == "1"
+PREMARKET_LLM_TOP_N = int(os.getenv("PREMARKET_LLM_TOP_N", "8"))
+
+# FINAL view behavior
+FINAL_VIEW_TOP_N = int(os.getenv("FINAL_VIEW_TOP_N", "3"))
+CONF_GATE = int(os.getenv("CONF_GATE", str(MIN_CONFIDENCE_TO_TRADE)))  # used only for stance reason text
+
+
+# -----------------------------
+# LLM helpers
+# -----------------------------
+def _llm_num_or_np(x) -> float | str:
+    """Return a positive float, else 'not provided' (prevents fake 0.0 values)."""
+    try:
+        v = float(pd.to_numeric(x, errors="coerce"))
+        return v if v > 0 else "not provided"
+    except Exception:
+        return "not provided"
+
+
+def _ensure_llm_col(dfx: pd.DataFrame) -> pd.DataFrame:
+    if dfx is None:
+        return pd.DataFrame()
+    if "llm_explanation" not in dfx.columns:
+        dfx = dfx.copy()
+        dfx["llm_explanation"] = ""
+    return dfx
+
+
+def _apply_llm_explanations(dfx: pd.DataFrame, *, horizon: str, top_n: int | None = None) -> pd.DataFrame:
+    """
+    Fill llm_explanation for top N rows of this dataframe (or all rows if top_n is None).
+    Uses ONLY existing row data (no made-up numbers).
+    """
+    dfx = _ensure_llm_col(dfx)
+
+    if (not PREMARKET_LLM_ENABLED) or dfx is None or dfx.empty:
+        return dfx
+
+    n = len(dfx) if top_n is None else min(int(top_n), len(dfx))
+    explain_df = dfx.head(n).copy()
+
+    expl: List[str] = []
+    for _, rr in explain_df.iterrows():
+        payload = {
+            "symbol": str(rr.get("symbol", "")).upper().strip(),
+            "decision": str(rr.get("decision", "")),
+            "score": int(pd.to_numeric(rr.get("score"), errors="coerce") or 0),
+            "confidence": int(pd.to_numeric(rr.get("confidence"), errors="coerce") or 0),
+            "pct_change": float(pd.to_numeric(rr.get("pct_change"), errors="coerce") or 0.0),
+
+            "current": _llm_num_or_np(rr.get("current")),
+            "predicted_price": _llm_num_or_np(rr.get("predicted_price")),
+            "target_price": _llm_num_or_np(rr.get("target_price")),
+            "stop_loss": _llm_num_or_np(rr.get("stop_loss")),
+            "forecast_atr": _llm_num_or_np(rr.get("forecast_atr")),
+
+            "forecast_trend": str(rr.get("forecast_trend") or ""),
+            "forecast_reason": str(rr.get("forecast_reason") or ""),
+            "news_flag": str(rr.get("news_flag") or ""),
+            "main_news_title": str(rr.get("main_news_title") or ""),
+            "reasons": str(rr.get("reasons") or ""),
+
+            "horizon": horizon,
+            "position_size_usd": float(os.getenv("DEFAULT_POSITION_SIZE_USD", "0") or 0) or "not provided",
+            "holding_window": str(rr.get("holding_window") or rr.get("horizon") or "intraday"),
+            "conf_gate": CONF_GATE,
+        }
+        expl.append(str(safe_explain_pick(payload) or "").strip())
+
+    explain_df["llm_explanation"] = expl
+    dfx.loc[explain_df.index, "llm_explanation"] = explain_df["llm_explanation"].astype(str)
+    return dfx
 
 
 # -----------------------------
@@ -102,10 +180,10 @@ def make_run_id(now: datetime) -> str:
 
 
 def _premarket_email_marker(now: datetime) -> Path:
-    # outputs/prod/runs/YYYYMMDD/premarket/email_sent_YYYY-MM-DD.txt
     d = run_dir(now, "premarket")
     run_date = now.strftime("%Y-%m-%d")
     return d / f"email_sent_{run_date}.txt"
+
 
 # -----------------------------
 # Email routing (env-aware)
@@ -310,13 +388,182 @@ def _infer_intraday_target_stop(row: pd.Series) -> tuple[Optional[float], Option
     return tgt, stp
 
 
-def _normalize_run_date_col(df: pd.DataFrame, col: str = "run_date") -> pd.DataFrame:
-    """Force YYYY-MM-DD strings to avoid mixed '2026-01-23 00:00:00' vs '2026-01-23' issues."""
-    if df is None or df.empty or col not in df.columns:
+# -----------------------------
+# Deterministic Plan Card (LOCKED FORMAT)
+# -----------------------------
+def _entry_range(cur: Optional[float], atr: Optional[float]) -> tuple[Optional[float], Optional[float]]:
+    if cur is None or cur <= 0:
+        return None, None
+    if atr is None or atr <= 0:
+        lo = cur * 0.9925
+        hi = cur * 1.0075
+        return lo, hi
+    lo = cur - 0.35 * atr
+    hi = cur + 0.35 * atr
+    return lo, hi
+
+
+def _time_window_bucket(conf: int, trend: str) -> str:
+    trend = (trend or "").lower()
+    if conf >= 7 and trend == "up":
+        return "2–3 days"
+    if conf >= 6:
+        return "1–2 days"
+    return "day"
+
+
+def _plan_card_row(r: pd.Series) -> str:
+    cur = _safe_float(r.get("current"))
+    tgt = _safe_float(r.get("target_price"))
+    stp = _safe_float(r.get("stop_loss"))
+    atr = _safe_float(r.get("forecast_atr"))
+    conf = int(pd.to_numeric(r.get("confidence"), errors="coerce") or 0)
+    trend = str(r.get("forecast_trend") or "")
+
+    lo, hi = _entry_range(cur, atr)
+    tw = _time_window_bucket(conf, trend)
+
+    def m(x):
+        return "" if x is None else f"{x:.2f}"
+
+    pl_up = pl_dn = rr = None
+    up_pct = dn_pct = None
+
+    if cur and tgt and stp and cur > 0:
+        pl_up = tgt - cur
+        pl_dn = stp - cur
+        up_pct = (pl_up / cur) * 100.0
+        dn_pct = (pl_dn / cur) * 100.0
+        risk = abs(pl_dn)
+        rr = (pl_up / risk) if risk > 0 else None
+
+    return "\n".join([
+        f"• Entry range: ${m(lo)}–${m(hi)} (cur ${m(cur)})" if (lo is not None and hi is not None) else f"• Entry range: not provided (cur ${m(cur)})",
+        f"• Time window: {tw}",
+        f"• Levels: target ${m(tgt)} | stop ${m(stp)}",
+        f"• P/L: +${m(pl_up)} ({m(up_pct)}%) | ${m(pl_dn)} ({m(dn_pct)}%) | R:R {m(rr)}" if rr is not None else "• P/L: not provided",
+        f"• Stance reason: conf {r.get('confidence')} vs gate {CONF_GATE} | news {r.get('news_flag')}",
+    ])
+
+
+# -----------------------------
+# NEW: RAW enrichment + High-vote + FINAL_VIEW
+# -----------------------------
+def _enrich_raw_movers(raw_df: pd.DataFrame, all_scored_df: pd.DataFrame) -> pd.DataFrame:
+    """RAW_MOVERS typically lacks target/stop/atr/trend. Enrich by joining ALL_SCORED on symbol."""
+    raw_df = raw_df.copy() if raw_df is not None else pd.DataFrame()
+    if raw_df.empty:
+        return _ensure_llm_col(raw_df)
+
+    if "symbol" not in raw_df.columns or all_scored_df is None or all_scored_df.empty:
+        return _ensure_llm_col(raw_df)
+
+    keep_cols = [
+        "symbol",
+        "predicted_price", "target_price", "stop_loss",
+        "forecast_trend", "forecast_atr", "forecast_reason",
+        "score", "score_label", "confidence",
+        "news_flag", "main_news_title", "main_news_link",
+        "reasons", "decision",
+    ]
+    enrich = all_scored_df.copy()
+    for c in keep_cols:
+        if c not in enrich.columns:
+            enrich[c] = pd.NA
+    enrich = enrich[keep_cols].drop_duplicates(subset=["symbol"])
+
+    out = raw_df.merge(enrich, on="symbol", how="left", suffixes=("", "_y"))
+    out = _ensure_llm_col(out)
+    return out
+
+
+def _vote_score(rr: pd.Series) -> int:
+    """Deterministic 'high-vote' score. No LLM involved."""
+    score = 0
+    conf = pd.to_numeric(rr.get("confidence"), errors="coerce")
+    scr = pd.to_numeric(rr.get("score"), errors="coerce")
+    pct = pd.to_numeric(rr.get("pct_change"), errors="coerce")
+    trend = str(rr.get("forecast_trend") or "").lower()
+    news = str(rr.get("news_flag") or "")
+
+    if pd.notna(conf) and int(conf) >= 6:
+        score += 3
+    if pd.notna(scr) and float(scr) >= 60:
+        score += 2
+    if pd.notna(pct) and abs(float(pct)) >= 5.0:
+        score += 1
+    if trend == "up":
+        score += 1
+
+    mover_signal = str(rr.get("mover_signal") or "")
+    if "❌" in mover_signal:
+        score -= 2
+
+    if news == "🔴":
+        score -= 2
+    elif news == "🟡":
+        score -= 1
+
+    return int(score)
+
+
+def _build_final_view(
+    *,
+    picks_df: pd.DataFrame,
+    monitor_df: pd.DataFrame,
+    all_scored_df: pd.DataFrame,
+    raw_enriched_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    FINAL_VIEW:
+      - If PICKS exist -> GO list (top picks)
+      - Else -> WATCH list (top 3 high-vote from combined sources)
+    """
+    cols_min = [
+        "symbol", "current", "pct_change",
+        "target_price", "stop_loss", "predicted_price",
+        "forecast_trend", "forecast_atr", "forecast_reason",
+        "score", "score_label", "confidence",
+        "news_flag", "main_news_title", "main_news_link",
+        "reasons", "decision", "llm_explanation",
+    ]
+
+    def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy() if df is not None else pd.DataFrame()
+        for c in cols_min:
+            if c not in df.columns:
+                df[c] = pd.NA
         return df
-    s = pd.to_datetime(df[col], errors="coerce")
-    df[col] = s.dt.date.astype(str)
-    return df
+
+    picks_df = _ensure_cols(picks_df)
+    monitor_df = _ensure_cols(monitor_df)
+    all_scored_df = _ensure_cols(all_scored_df)
+    raw_enriched_df = _ensure_cols(raw_enriched_df)
+
+    if picks_df is not None and not picks_df.empty:
+        final = picks_df.copy()
+        final["stance"] = "GO"
+        final["stance_reason"] = final.apply(
+            lambda r: f"conf {r.get('confidence')} vs gate {CONF_GATE} | news {r.get('news_flag')}",
+            axis=1
+        )
+        return final.reset_index(drop=True)
+
+    combined = pd.concat([monitor_df, all_scored_df, raw_enriched_df], ignore_index=True)
+    combined = combined.dropna(subset=["symbol"]).copy()
+    combined["symbol"] = combined["symbol"].astype(str).str.upper().str.strip()
+    combined = combined.drop_duplicates(subset=["symbol"])
+
+    combined["vote_score"] = combined.apply(_vote_score, axis=1)
+    combined = combined.sort_values(by=["vote_score", "confidence", "score"], ascending=False)
+
+    final = combined.head(FINAL_VIEW_TOP_N).copy()
+    final["stance"] = "WATCH"
+    final["stance_reason"] = final.apply(
+        lambda r: f"conf {r.get('confidence')} vs gate {CONF_GATE} | vote {r.get('vote_score')} | news {r.get('news_flag')}",
+        axis=1
+    )
+    return final.reset_index(drop=True)
 
 
 # -----------------------------
@@ -341,7 +588,7 @@ ensure_csv_exists(DAILY_LOG_CSV, [
     "forecast_trend", "forecast_atr", "forecast_reason",
     "trade_plan", "earnings_risk",
     "decision", "score", "score_label", "confidence",
-    "reasons", "news_flag", "main_news_title", "main_news_link",
+    "reasons", "llm_explanation", "news_flag", "main_news_title", "main_news_link",
 ])
 
 
@@ -377,12 +624,55 @@ def append_recommendations_log(df_reco: pd.DataFrame, now: datetime, mode: str) 
     out.to_csv(RECO_LOG_CSV, mode="a", header=not file_exists, index=False)
 
 
+def append_daily_log(df_rows: pd.DataFrame, run_date: str, mode: str) -> None:
+    """
+    Source-of-truth log for postmarket evaluation.
+    Writes FINAL_VIEW rows (GO + WATCH) with stable schema.
+    """
+    if df_rows is None or df_rows.empty:
+        return
+
+    cols = [
+        "run_date", "mode", "symbol", "price_category",
+        "current", "predicted_price", "target_price", "stop_loss",
+        "forecast_trend", "forecast_atr", "forecast_reason",
+        "trade_plan", "earnings_risk",
+        "decision", "score", "score_label", "confidence",
+        "reasons", "llm_explanation", "news_flag", "main_news_title", "main_news_link",
+    ]
+
+    out = df_rows.copy()
+    out["run_date"] = run_date
+    out["mode"] = mode
+
+    for c in cols:
+        if c not in out.columns:
+            out[c] = pd.NA
+    out = out[cols]
+
+    for c in ["current", "predicted_price", "target_price", "stop_loss", "forecast_atr"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    existing = (
+        pd.read_csv(DAILY_LOG_CSV)
+        if (os.path.exists(DAILY_LOG_CSV) and os.path.getsize(DAILY_LOG_CSV) > 0)
+        else pd.DataFrame(columns=cols)
+    )
+    existing = existing.reindex(columns=cols)
+
+    merged = pd.concat([existing, out], ignore_index=True)
+    merged["symbol"] = merged["symbol"].astype(str).str.upper().str.strip()
+    merged = merged.drop_duplicates(subset=["run_date", "mode", "symbol"], keep="last")
+    merged.to_csv(DAILY_LOG_CSV, index=False)
+
+
 # -----------------------------
 # Excel writer
 # -----------------------------
 def write_premarket_excel(
     excel_path: str,
     *,
+    final_view_df: pd.DataFrame,
     picks_df: pd.DataFrame,
     candidates_df: pd.DataFrame,
     monitor_df: pd.DataFrame,
@@ -395,6 +685,7 @@ def write_premarket_excel(
         excel_path_p.parent.mkdir(parents=True, exist_ok=True)
 
         with pd.ExcelWriter(excel_path, engine="openpyxl") as xw:
+            (final_view_df if final_view_df is not None else pd.DataFrame()).to_excel(xw, sheet_name="FINAL_VIEW", index=False)
             (picks_df if picks_df is not None else pd.DataFrame()).to_excel(xw, sheet_name="PICKS", index=False)
             (candidates_df if candidates_df is not None else pd.DataFrame()).to_excel(xw, sheet_name="CANDIDATES", index=False)
             (monitor_df if monitor_df is not None else pd.DataFrame()).to_excel(xw, sheet_name="MONITOR_TOP20", index=False)
@@ -418,7 +709,7 @@ def run_premarket(now: datetime | None = None) -> None:
     mode = "premarket"
     rf = run_dir(now, mode)
     run_date = now.strftime("%Y-%m-%d")
-    # Prevent duplicate emails for same run_date
+
     marker = _premarket_email_marker(now)
     if marker.exists():
         print("📩 Premarket email already sent for this run_date — skipping resend.")
@@ -426,34 +717,36 @@ def run_premarket(now: datetime | None = None) -> None:
 
     tickers = fetch_sp500_tickers()
     movers = calculate_top_movers(tickers, top_n=TOP_N)
-    df = pd.DataFrame(movers)
+    df_raw = pd.DataFrame(movers)
 
     excel_path = out_path(
         f"premarket_{now.strftime('%Y%m%d')}_{make_run_id(now)}.xlsx",
         now=now, mode=mode, kind="runs"
     )
 
-    if df.empty:
+    if df_raw.empty:
+        empty = _ensure_llm_col(pd.DataFrame())
         write_premarket_excel(
             excel_path,
-            picks_df=pd.DataFrame(),
-            candidates_df=pd.DataFrame(),
-            monitor_df=pd.DataFrame(),
-            all_scored_df=pd.DataFrame(),
-            raw_movers_df=df,
+            final_view_df=empty,
+            picks_df=empty,
+            candidates_df=empty,
+            monitor_df=empty,
+            all_scored_df=empty,
+            raw_movers_df=empty,
             rf=Path(rf),
         )
         send_email(f"🌅 Premarket Picks ({run_date})", "<p>No movers returned.</p>", attachment_path=excel_path)
         return
 
-    df["pct_change"] = pd.to_numeric(df.get("pct_change"), errors="coerce").fillna(0.0)
-    df["current"] = pd.to_numeric(df.get("current"), errors="coerce").fillna(0.0)
+    df_raw["pct_change"] = pd.to_numeric(df_raw.get("pct_change"), errors="coerce").fillna(0.0)
+    df_raw["current"] = pd.to_numeric(df_raw.get("current"), errors="coerce").fillna(0.0)
 
     snapshot = get_market_snapshot()
     market_trend = snapshot.get("trend", "up")
 
     rows: List[Dict[str, Any]] = []
-    for _, r in df.iterrows():
+    for _, r in df_raw.iterrows():
         sym = str(r.get("symbol", "")).upper().strip()
         current = float(r.get("current", 0.0) or 0.0)
         pct_change = float(r.get("pct_change", 0.0) or 0.0)
@@ -491,6 +784,7 @@ def run_premarket(now: datetime | None = None) -> None:
             "score_label": score_label,
             "confidence": int(conf),
             "reasons": reasons,
+            "llm_explanation": "",
             "news_flag": flag,
             "main_news_title": title,
             "main_news_link": link,
@@ -515,111 +809,87 @@ def run_premarket(now: datetime | None = None) -> None:
 
     picks_df = candidates_df.head(int(TRADE_MAX_PICKS)).copy().reset_index(drop=True)
 
+    # Ensure picks have target/stop
     if not picks_df.empty:
         tgt_fix, stp_fix = [], []
         for _, r in picks_df.iterrows():
             tgt, stp = _infer_intraday_target_stop(r)
             tgt_fix.append(tgt if tgt is not None else pd.NA)
             stp_fix.append(stp if stp is not None else pd.NA)
-        picks_df["target_price"] = pd.to_numeric(pd.Series(tgt_fix), errors="coerce")
-        picks_df["stop_loss"] = pd.to_numeric(pd.Series(stp_fix), errors="coerce")
+        picks_df["target_price"] = pd.to_numeric(pd.Series(tgt_fix, index=picks_df.index), errors="coerce")
+        picks_df["stop_loss"] = pd.to_numeric(pd.Series(stp_fix, index=picks_df.index), errors="coerce")
 
-    daily_cols = [
-        "run_date", "mode", "symbol", "price_category",
-        "current", "predicted_price", "target_price", "stop_loss",
-        "forecast_trend", "forecast_atr", "forecast_reason",
-        "trade_plan", "earnings_risk",
-        "decision", "score", "score_label", "confidence",
-        "reasons", "news_flag", "main_news_title", "main_news_link",
-    ]
+    # Enrich raw movers and build FINAL_VIEW
+    raw_enriched_df = _enrich_raw_movers(df_raw, all_scored_df)
+    final_view_df = _build_final_view(
+        picks_df=picks_df,
+        monitor_df=monitor_df,
+        all_scored_df=all_scored_df,
+        raw_enriched_df=raw_enriched_df,
+    )
 
-    picks_log = picks_df.copy()
-    picks_log["run_date"] = run_date
-    picks_log["mode"] = "premarket"
-
-    # Ensure schema (without forcing "" into numeric columns yet)
-    picks_log = picks_log.reindex(columns=daily_cols)
-
-    for c in ["current", "predicted_price", "target_price", "stop_loss"]:
-        if c in picks_log.columns:
-            picks_log[c] = pd.to_numeric(picks_log[c], errors="coerce")
-
-    # Final defense: ensure target/stop exist
-    if not picks_log.empty:
+    # FINAL_VIEW: enforce levels + deterministic plan_card
+    if not final_view_df.empty:
         tgt_fix, stp_fix = [], []
-        for _, r in picks_log.iterrows():
+        for _, r in final_view_df.iterrows():
             tgt, stp = _infer_intraday_target_stop(r)
             tgt_fix.append(tgt if tgt is not None else pd.NA)
             stp_fix.append(stp if stp is not None else pd.NA)
-        picks_log["target_price"] = pd.to_numeric(pd.Series(tgt_fix), errors="coerce")
-        picks_log["stop_loss"] = pd.to_numeric(pd.Series(stp_fix), errors="coerce")
 
-    # Normalize run_date (prevents mixed formats)
-    picks_log = _normalize_run_date_col(picks_log, "run_date")
+        final_view_df["target_price"] = pd.to_numeric(pd.Series(tgt_fix, index=final_view_df.index), errors="coerce")
+        final_view_df["stop_loss"] = pd.to_numeric(pd.Series(stp_fix, index=final_view_df.index), errors="coerce")
+        final_view_df["plan_card"] = final_view_df.apply(_plan_card_row, axis=1)
+    else:
+        final_view_df = final_view_df.copy()
+        final_view_df["plan_card"] = ""
 
-    # Load existing (stable schema)
-    existing = (
-        pd.read_csv(DAILY_LOG_CSV)
-        if (os.path.exists(DAILY_LOG_CSV) and os.path.getsize(DAILY_LOG_CSV) > 0)
-        else pd.DataFrame(columns=daily_cols)
-    )
-    existing = existing.reindex(columns=daily_cols)
-    existing = _normalize_run_date_col(existing, "run_date")
+    # -----------------------------
+    # LLM explanations (OPTIONAL)
+    #   - Keep TOP-N behavior for big tables (cost control)
+    #   - ALWAYS fill FINAL_VIEW (small list)
+    # -----------------------------
+    picks_df = _apply_llm_explanations(picks_df, horizon="premarket_picks", top_n=PREMARKET_LLM_TOP_N)
+    monitor_df = _apply_llm_explanations(monitor_df, horizon="premarket_monitor", top_n=PREMARKET_LLM_TOP_N)
+    candidates_df = _apply_llm_explanations(candidates_df, horizon="premarket_candidates", top_n=PREMARKET_LLM_TOP_N)
+    all_scored_df = _apply_llm_explanations(all_scored_df, horizon="premarket_all_scored", top_n=PREMARKET_LLM_TOP_N)
+    final_view_df = _apply_llm_explanations(final_view_df, horizon="premarket_final_view", top_n=None)
+    raw_enriched_df = _apply_llm_explanations(raw_enriched_df, horizon="premarket_raw_enriched", top_n=PREMARKET_LLM_TOP_N)
 
-    # Normalize keys (strings), keep symbol clean
-    for k in ["run_date", "mode", "symbol"]:
-        existing[k] = existing[k].astype(str)
-        picks_log[k] = picks_log[k].astype(str)
-    picks_log["symbol"] = picks_log["symbol"].str.upper().str.strip()
-
-    # Concat only non-empty frames (reduces FutureWarning)
-    frames = [f for f in [existing, picks_log] if f is not None and not f.empty]
-    merged = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=daily_cols)
-
-    if not merged.empty:
-        merged = merged.drop_duplicates(subset=["run_date", "mode", "symbol"], keep="last")
-
-    merged.to_csv(DAILY_LOG_CSV, index=False)
-
-    # RECO log
+    # RECO log (optional legacy)
     append_recommendations_log(candidates_df, now, mode="premarket")
 
-    # Portfolio open add (best-effort)
-    try:
-        cfg = PortfolioConfig()
-        open_df = load_open_portfolio(cfg)
-        for c in ["symbol", "current", "target_price", "stop_loss", "score", "confidence", "decision", "forecast_trend"]:
-            if c not in picks_df.columns:
-                picks_df[c] = pd.NA
-        updated_open, added_df = add_new_positions_from_picks(cfg, open_df, picks_df, now)
-        save_open_portfolio(cfg, updated_open)
-        append_open_actions(cfg, added_df)
-    except Exception as e:
-        (Path(rf) / "portfolio_error.txt").write_text(repr(e), encoding="utf-8")
+    # DAILY log (source-of-truth for postmarket)
+    append_daily_log(final_view_df, run_date, mode="premarket")
+
+    # Portfolio open add (best-effort) only when real PICKS exist
+    if not picks_df.empty:
+        try:
+            cfg = PortfolioConfig()
+            open_df = load_open_portfolio(cfg)
+            for c in ["symbol", "current", "target_price", "stop_loss", "score", "confidence", "decision", "forecast_trend"]:
+                if c not in picks_df.columns:
+                    picks_df[c] = pd.NA
+            updated_open, added_df = add_new_positions_from_picks(cfg, open_df, picks_df, now)
+            save_open_portfolio(cfg, updated_open)
+            append_open_actions(cfg, added_df)
+        except Exception as e:
+            (Path(rf) / "portfolio_error.txt").write_text(repr(e), encoding="utf-8")
 
     # Excel
     write_premarket_excel(
         excel_path,
+        final_view_df=final_view_df,
         picks_df=picks_df,
         candidates_df=candidates_df,
         monitor_df=monitor_df,
         all_scored_df=all_scored_df,
-        raw_movers_df=df,
+        raw_movers_df=raw_enriched_df,
         rf=Path(rf),
     )
 
-    # Email
-    if picks_df.empty:
-        html = f"""
-        <h2>🌅 Premarket Picks ({run_date})</h2>
-        <p>No picks passed filters.</p>
-        <p><b>Monitor Mode:</b> See Excel sheets <b>MONITOR_TOP20</b> and <b>ALL_SCORED</b>.</p>
-        <p><b>Attachment:</b> Excel included.</p>
-        """
-        if send_email(f"🌅 Premarket Picks ({run_date})", html, attachment_path=excel_path):
-            marker.write_text("sent\n", encoding="utf-8")
-        return
-
+    # -----------------------------
+    # Email (always shows FINAL_VIEW + deterministic PLAN_CARD)
+    # -----------------------------
     def _fmt_money(v) -> str:
         try:
             if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -635,10 +905,14 @@ def run_premarket(now: datetime | None = None) -> None:
         stp = _fmt_money(rr.get("stop_loss"))
         score = _html.escape(str(rr.get("score", "")))
         conf = _html.escape(str(rr.get("confidence", "")))
-        dec = _html.escape(str(rr.get("decision", "")))
+        stance = _html.escape(str(rr.get("stance", rr.get("decision", ""))))
         title = _html.escape(str(rr.get("main_news_title") or ""))
         link = str(rr.get("main_news_link") or "").strip() or "#"
-        reasons = _html.escape(str(rr.get("reasons") or ""))[:600]
+        reasons = _html.escape(str(rr.get("reasons") or ""))[:350]
+
+        # ✅ locked deterministic card
+        plan = _html.escape(str(rr.get("plan_card") or ""))[:900].replace("\n", "<br>")
+
         return f"""
         <tr>
           <td><b>{sym}</b></td>
@@ -647,36 +921,40 @@ def run_premarket(now: datetime | None = None) -> None:
           <td>{stp}</td>
           <td>{score}</td>
           <td>{conf}</td>
-          <td>{dec}</td>
+          <td>{stance}</td>
           <td><a href="{link}" target="_blank">{title}</a></td>
           <td style="color:#444;">{reasons}</td>
+          <td style="color:#333;white-space:normal;">{plan}</td>
         </tr>
         """
 
-    rows_html = "\n".join([row_html(rr) for _, rr in picks_df.iterrows()])
+    rows_html = "\n".join([row_html(rr) for _, rr in final_view_df.iterrows()])
+    mode_note = "Qualified Picks (GO)" if (picks_df is not None and not picks_df.empty) else "High Vote Watchlist (WATCH)"
 
     html = f"""
-    <h2>🌅 Premarket Picks ({run_date})</h2>
+    <h2>🌅 Premarket ({run_date})</h2>
     <p>
       <b>Market trend:</b> {_html.escape(str(snapshot.get("trend")))} |
       <b>SPY gap:</b> {snapshot.get("spy_gap_pct", 0.0):.2f}% |
       <b>VIX:</b> {snapshot.get("vix")}
     </p>
+    <p><b>Mode:</b> {mode_note}</p>
     <p>Filters: confidence ≥ {MIN_CONFIDENCE_TO_TRADE}, price ≤ ${MAX_PRICE} (elite override allowed).</p>
-    <p><b>Win rule (postmarket):</b> target hit anytime after recommendation (intraday high ≥ target).</p>
 
     <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial;font-size:13px;">
       <tr style="background:#eee;">
-        <th>Symbol</th><th>Price</th><th>Target</th><th>Stop</th><th>Score</th><th>Conf</th><th>Decision</th><th>Headline</th><th>Reasons</th>
+        <th>Symbol</th><th>Price</th><th>Target</th><th>Stop</th><th>Score</th><th>Conf</th><th>Stance</th><th>Headline</th><th>Reasons</th><th>Plan Card (Locked)</th>
       </tr>
       {rows_html}
     </table>
 
-    <p><b>Attachment:</b> Excel included with sheets: PICKS, CANDIDATES, MONITOR_TOP20, ALL_SCORED, RAW_MOVERS.</p>
+    <p><b>Attachment:</b> Excel included with sheets: FINAL_VIEW, PICKS, CANDIDATES, MONITOR_TOP20, ALL_SCORED, RAW_MOVERS.</p>
     """
-    if send_email(f"🌅 Premarket Picks ({run_date})", html, attachment_path=excel_path):
+
+    if send_email(f"🌅 Premarket ({run_date})", html, attachment_path=excel_path):
         marker.write_text("sent\n", encoding="utf-8")
-    print(f"✅ Premarket complete | picks={len(picks_df)} | excel={excel_path}")
+
+    print(f"✅ Premarket complete | final_view={len(final_view_df)} | picks={len(picks_df)} | excel={excel_path}")
 
 
 if __name__ == "__main__":
