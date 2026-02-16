@@ -11,6 +11,7 @@ from premarket_runner import run_premarket
 from midday_runner import run_midday
 from postmarket_runner import run_postmarket
 from options.option_mode import run_options_mode
+from agent_monitor import run_agent_monitor  # ✅ NEW
 
 LOCAL_TZ = ZoneInfo("America/Chicago")
 
@@ -35,7 +36,7 @@ def main() -> None:
 
     parser.add_argument(
         "--mode",
-        choices=["premarket", "midday", "postmarket", "options", "all"],
+        choices=["premarket", "midday", "postmarket", "options", "agent_monitor", "all"],  # ✅ add agent_monitor
         required=True,
         help="Which runner to execute",
     )
@@ -46,7 +47,7 @@ def main() -> None:
         help="Run without sending emails (safe test)",
     )
 
-    # ✅ NEW: Locks (you can lock normal trading and/or options trading)
+    # ✅ Locks
     parser.add_argument(
         "--lock-normal",
         action="store_true",
@@ -80,7 +81,6 @@ def main() -> None:
 
     now = datetime.now(LOCAL_TZ)
 
-    # ---- ROUTING with LOCKS ----
     def run_mode(mode: str) -> None:
         # Block normal trading modes if locked
         if mode in NORMAL_MODES and normal_locked:
@@ -101,6 +101,8 @@ def main() -> None:
             run_postmarket(now)
         elif mode == "options":
             run_options_mode(now=now, dry_run=args.dry_run)
+        elif mode == "agent_monitor":
+            run_agent_monitor(now=now)  # ✅ pass now if your function supports it; if not, use run_agent_monitor()
 
     if args.mode == "all":
         print("🚀 Running ALL modes in sequence (respecting locks)")
@@ -116,6 +118,10 @@ def main() -> None:
 
         print("\n📊 POSTMARKET")
         run_mode("postmarket")
+
+        print("\n🤖 AGENT MONITOR")
+        run_mode("agent_monitor")
+
     else:
         run_mode(args.mode)
 
