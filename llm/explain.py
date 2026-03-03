@@ -224,17 +224,17 @@ def _time_window_bucket(row: dict, cur: float | None, atr: float | None) -> str:
 
 def _stance_and_reason(row: dict) -> tuple[str, str]:
     """
-    Deterministic stance.
-    - If row says decision Strong/High/etc -> GO
-    - Else if confidence is close -> WATCH
-    - Else AVOID
-    Reason includes confidence vs gate if available.
+    Deterministic stance aligned with pipeline decisions.
+    Maps:
+      Strong Buy -> GO
+      Moderate   -> WATCH
+      Not Advisable -> AVOID
+    Falls back to confidence if unclear.
     """
+
     decision = str(row.get("decision") or "").strip().lower()
     conf = row.get("confidence")
     score = row.get("score")
-
-    # Optional gates passed in via row (if you include them)
     gate = row.get("conf_gate")  # optional
 
     try:
@@ -242,23 +242,21 @@ def _stance_and_reason(row: dict) -> tuple[str, str]:
     except Exception:
         conf_i = None
 
-    # Heuristic based on available fields
-    if decision in {"go", "strong", "high", "qualified", "pick"}:
+    # --- Explicit decision mapping ---
+    if "strong buy" in decision or decision in {"go", "qualified", "pick"}:
         stance = "GO"
+    elif "moderate" in decision or "watch" in decision:
+        stance = "WATCH"
+    elif "not advisable" in decision or "avoid" in decision:
+        stance = "AVOID"
     else:
-        # If your pipeline sets decision like "Moderate"/"Avoid", respect it:
-        if "avoid" in decision:
-            stance = "AVOID"
-        elif "moderate" in decision:
+        # fallback to confidence
+        if conf_i is not None and conf_i >= 7:
+            stance = "GO"
+        elif conf_i is not None and conf_i >= 5:
             stance = "WATCH"
         else:
-            # fall back to confidence
-            if conf_i is not None and conf_i >= 7:
-                stance = "GO"
-            elif conf_i is not None and conf_i >= 5:
-                stance = "WATCH"
-            else:
-                stance = "AVOID"
+            stance = "AVOID"
 
     news_flag = row.get("news_flag")
     news_part = f"news {news_flag}" if news_flag not in (None, "", "not provided") else "news not provided"
@@ -312,6 +310,52 @@ def _levels_block(row: dict) -> str:
         stp_s = "not provided"
     return f"target {tgt_s} | stop {stp_s}"
 
+def _baseline_coach_from_stats(run_date: str, prem_s: dict, mid_s: dict, all_s: dict) -> str:
+    try:
+        evaluated = int(all_s.get("evaluated", 0) or 0)
+        wins = int(all_s.get("wins", 0) or 0)
+        losses = int(all_s.get("losses", 0) or 0)
+        not_hit = int(all_s.get("not_hit", 0) or 0)
+        win_rate = float(all_s.get("win_rate", 0.0) or 0.0)
+    except Exception:
+        evaluated, wins, losses, not_hit, win_rate = 0, 0, 0, 0, 0.0
+
+    if evaluated <= 0:
+        return "\n".join([
+            "- What happened: No evaluated trades in stats.",
+            "- Likely loss drivers: not provided",
+            "- What worked: not provided",
+            "- Next-session process tweak: Verify that evaluation rows are being written to performance_log.",
+            "- Risk control tweak: Keep risk minimal until evaluation data is stable.",
+        ])
+
+    stop_rate = (losses / evaluated * 100.0) if evaluated else 0.0
+    not_hit_rate = (not_hit / evaluated * 100.0) if evaluated else 0.0
+
+    # Deterministic, neutral language (no “you should”)
+    likely_driver = "Many setups did not reach targets within the session window." if not_hit_rate >= 50 else "Mixed follow-through; some setups did not complete."
+    worked = "Low stop-hit rate suggests risk containment held." if losses == 0 else "Stops triggered, indicating adverse moves were contained."
+
+    tweak_parts = []
+    if not_hit_rate >= 60:
+        tweak_parts.append("Tighten time-scaled targets (esp. midday) or skip late recommendations.")
+    if stop_rate >= 40:
+        tweak_parts.append("Increase selectivity: raise confidence gate for the weaker session or reduce noisy movers.")
+    if not tweak_parts:
+        tweak_parts.append("Keep parameters stable; collect more samples before changing thresholds.")
+
+    risk_parts = []
+    if evaluated < 6:
+        risk_parts.append("Small sample size: keep position sizing conservative.")
+    risk_parts.append("Cap number of midday trades when time-left is low.")
+
+    return "\n".join([
+        f"- What happened: evaluated={evaluated}, wins={wins}, losses={losses}, not_hit={not_hit}, win_rate={win_rate:.2f}%.",
+        f"- Likely loss drivers: {likely_driver}",
+        f"- What worked: {worked}",
+        f"- Next-session process tweak: {' '.join(tweak_parts)}",
+        f"- Risk control tweak: {' '.join(risk_parts)}",
+    ])
 
 def _baseline_card_from_row(row: dict) -> str:
     """
@@ -374,36 +418,49 @@ def _force_exact_lines(text: str, labels: list[str], *, strict: bool) -> str:
 def _run_with_retry(prompt: str, labels: list[str], *, max_tokens: int, row: dict | None = None) -> str:
     """
     One retry in STRICT mode if output still malformed.
-    If output is weak or risky, return deterministic baseline (if row provided).
+    Always enforce hallucination guard.
     """
+
     raw = llm_text(prompt, max_output_tokens=max_tokens).strip()
     out = _force_exact_lines(raw, labels, strict=STRICT_LLM)
+
+    # 🚨 Always enforce hallucination guard
+    if row is not None and _llm_has_new_numbers(out, row):
+        return _baseline_card_from_row(row)
 
     if STRICT_LLM:
         weak = (out == _fallback_block(labels)) or (
             sum("not provided" in ln.lower() for ln in out.splitlines()) >= len(labels) - 2
         )
+
         if weak:
             raw2 = llm_text(
                 prompt
                 + "\nFINAL WARNING: Use ONLY DATA values; compute entry range and P/L only from current/ATR/target/stop; keep label format exact.",
                 max_output_tokens=max_tokens,
             ).strip()
+
             out2 = _force_exact_lines(raw2, labels, strict=STRICT_LLM)
 
-            if row is not None:
-                weak2 = (out2 == _fallback_block(labels)) or (
-                    sum("not provided" in ln.lower() for ln in out2.splitlines()) >= len(labels) - 2
-                )
-                if weak2 or _llm_has_new_numbers(out2, row):
-                    return _baseline_card_from_row(row)
+            # 🚨 Guard again after retry
+            if row is not None and _llm_has_new_numbers(out2, row):
+                return _baseline_card_from_row(row)
+
+            weak2 = (out2 == _fallback_block(labels)) or (
+                sum("not provided" in ln.lower() for ln in out2.splitlines()) >= len(labels) - 2
+            )
+
+            if weak2:
+                return _baseline_card_from_row(row)
+
             return out2
 
+    # Non-strict mode fallback
     if row is not None:
         weak = (out == _fallback_block(labels)) or (
             sum("not provided" in ln.lower() for ln in out.splitlines()) >= len(labels) - 2
         )
-        if weak or _llm_has_new_numbers(out, row):
+        if weak:
             return _baseline_card_from_row(row)
 
     return out
@@ -433,7 +490,12 @@ BASELINE:
 """.strip()
 
     # If STRICT is on, sanitizer ensures no banned phrasing survives
-    return _run_with_retry(prompt, CARD_LINES, max_tokens=220, row=row)
+    return _run_with_retry(
+        prompt,
+        CARD_LINES,
+        max_tokens=220,
+        row={"row": row, "baseline": baseline},  # includes derived numbers for guard
+    )
 
 
 def safe_explain_pick(row: dict) -> str:
@@ -470,10 +532,46 @@ combined: {all_s}
 """.strip()
     return _run_with_retry(prompt, COACH_LINES, max_tokens=280)
 
+def _is_weak_block(text: str, labels: list[str]) -> bool:
+    """
+    Weak if:
+    - empty
+    - fallback block
+    - too many 'not provided'
+    - wrong labels/line count
+    """
+    t = _normalize_text(text)
+    if not t:
+        return True
+
+    # Exact fallback string check
+    if t.strip() == _fallback_block(labels).strip():
+        return True
+
+    lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
+    if len(lines) != len(labels):
+        return True
+
+    if not all(lines[i].startswith(labels[i]) for i in range(len(labels))):
+        return True
+
+    np_count = sum("not provided" in ln.lower() for ln in lines)
+    return np_count >= len(labels) - 2
 
 def safe_postmarket_coach(run_date: str, prem_s: dict, mid_s: dict, all_s: dict) -> str:
     try:
-        return postmarket_coach(run_date, prem_s, mid_s, all_s)
+        out = postmarket_coach(run_date, prem_s, mid_s, all_s)
+
+        # ✅ If LLM returns weak/empty/not-provided block, use deterministic coach
+        if _is_weak_block(out, COACH_LINES):
+            return _baseline_coach_from_stats(run_date, prem_s, mid_s, all_s)
+
+        return out
+
     except Exception as e:
-        fb = _fallback_block(COACH_LINES)
-        return f"{fb}\n(LLM unavailable: {type(e).__name__})"
+        # ✅ Hard failure: deterministic fallback first
+        try:
+            return _baseline_coach_from_stats(run_date, prem_s, mid_s, all_s)
+        except Exception:
+            fb = _fallback_block(COACH_LINES)
+            return f"{fb}\n(LLM unavailable: {type(e).__name__})"

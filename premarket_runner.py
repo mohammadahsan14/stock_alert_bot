@@ -583,6 +583,7 @@ ensure_csv_exists(RECO_LOG_CSV, [
 ])
 
 ensure_csv_exists(DAILY_LOG_CSV, [
+    "run_ts",
     "run_date", "mode", "symbol", "price_category",
     "current", "predicted_price", "target_price", "stop_loss",
     "forecast_trend", "forecast_atr", "forecast_reason",
@@ -624,15 +625,12 @@ def append_recommendations_log(df_reco: pd.DataFrame, now: datetime, mode: str) 
     out.to_csv(RECO_LOG_CSV, mode="a", header=not file_exists, index=False)
 
 
-def append_daily_log(df_rows: pd.DataFrame, run_date: str, mode: str) -> None:
-    """
-    Source-of-truth log for postmarket evaluation.
-    Writes FINAL_VIEW rows (GO + WATCH) with stable schema.
-    """
+def append_daily_log(df_rows: pd.DataFrame, now: datetime, run_date: str, mode: str) -> None:
     if df_rows is None or df_rows.empty:
         return
 
     cols = [
+        "run_ts",
         "run_date", "mode", "symbol", "price_category",
         "current", "predicted_price", "target_price", "stop_loss",
         "forecast_trend", "forecast_atr", "forecast_reason",
@@ -642,6 +640,7 @@ def append_daily_log(df_rows: pd.DataFrame, run_date: str, mode: str) -> None:
     ]
 
     out = df_rows.copy()
+    out["run_ts"] = now.strftime("%Y-%m-%d %H:%M:%S")
     out["run_date"] = run_date
     out["mode"] = mode
 
@@ -671,7 +670,6 @@ def append_daily_log(df_rows: pd.DataFrame, run_date: str, mode: str) -> None:
 # -----------------------------
 def write_premarket_excel(
     excel_path: str,
-    *,
     final_view_df: pd.DataFrame,
     picks_df: pd.DataFrame,
     candidates_df: pd.DataFrame,
@@ -859,8 +857,7 @@ def run_premarket(now: datetime | None = None) -> None:
     append_recommendations_log(candidates_df, now, mode="premarket")
 
     # DAILY log (source-of-truth for postmarket)
-    append_daily_log(final_view_df, run_date, mode="premarket")
-
+    append_daily_log(final_view_df, now, run_date, mode="premarket")
     # Portfolio open add (best-effort) only when real PICKS exist
     if not picks_df.empty:
         try:

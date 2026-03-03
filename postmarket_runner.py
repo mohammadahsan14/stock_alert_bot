@@ -58,6 +58,8 @@ POST_MARKET_START = POST_MARKET_START_CT
 
 # Debug artifacts (set POSTMARKET_DEBUG=1 to enable extra CSVs)
 POSTMARKET_DEBUG = os.getenv("POSTMARKET_DEBUG", "0") == "1"
+# Local testing override: clamp late reco timestamps to session_start so evaluation still runs
+EVAL_CLAMP_LATE_RECO = os.getenv("EVAL_CLAMP_LATE_RECO", "0") == "1"
 
 
 # -----------------------------
@@ -374,6 +376,8 @@ Output format (exact):
 - What worked:
 - What didn’t:
 - Tomorrow tweak:
+
+Return exactly 4 lines, each starting with the bullet label above. No extra lines.
 """
     try:
         return llm_text(prompt, max_output_tokens=220).strip()
@@ -599,7 +603,7 @@ def load_midday_today(daily_log_csv: str, run_date: str) -> pd.DataFrame:
 
     # pick latest per symbol for the day (if duplicates exist)
     if "run_ts" in df.columns:
-        df["run_ts"] = pd.to_datetime(df["run_ts"], errors="coerce")
+        df["run_ts"] = df["run_ts"].apply(_parse_ts_maybe)
         df = df.sort_values("run_ts").drop_duplicates(subset=["symbol"], keep="last")
 
     df["source_mode"] = "midday"
@@ -616,8 +620,10 @@ def evaluate_rows(df_in: pd.DataFrame, run_date: str) -> pd.DataFrame:
     df = df_in.copy()
     df = _ensure_cols(
         df,
-        ["symbol", "decision", "score", "confidence", "current", "target_price", "stop_loss", "source_mode", "instrument_type", "run_ts"],
+        ["symbol", "decision", "score", "confidence", "current", "target_price", "stop_loss",
+         "source_mode", "instrument_type", "run_ts"],
     )
+
     df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
     df["decision"] = df["decision"].astype(str)
     df["source_mode"] = df["source_mode"].astype(str)
@@ -630,6 +636,7 @@ def evaluate_rows(df_in: pd.DataFrame, run_date: str) -> pd.DataFrame:
 
     session_start, session_end = _session_bounds(run_date)
 
+    # Build reco_ts from run_ts when available, otherwise session_start
     reco_ts_list = []
     for _, r in df.iterrows():
         rt = None
@@ -638,6 +645,10 @@ def evaluate_rows(df_in: pd.DataFrame, run_date: str) -> pd.DataFrame:
         reco_ts_list.append(rt if rt is not None else session_start)
 
     df["reco_ts"] = reco_ts_list
+
+    # ✅ HARDEN: ensure reco_ts is always tz-aware datetime (never NaT)
+    df["reco_ts"] = df["reco_ts"].apply(lambda x: _parse_ts_maybe(x) or session_start)
+
     df["session_start"] = session_start.strftime("%Y-%m-%d %H:%M:%S")
     df["session_end"] = session_end.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -662,6 +673,7 @@ def evaluate_rows(df_in: pd.DataFrame, run_date: str) -> pd.DataFrame:
         target = _safe_float(r.get("target_price"))
         stop = _safe_float(r.get("stop_loss"))
 
+        # ✅ Use reco_ts (not reco_dt)
         reco_dt = r.get("reco_ts")
         if isinstance(reco_dt, str):
             reco_dt = _parse_ts_maybe(reco_dt)
@@ -674,23 +686,27 @@ def evaluate_rows(df_in: pd.DataFrame, run_date: str) -> pd.DataFrame:
             reco_dt = session_start
 
         if reco_dt > session_end:
-            outcomes.append("⛔ Skipped (Late Recommendation)")
-            day_highs.append(pd.NA)
-            day_lows.append(pd.NA)
-            closes.append(_get_close_for_date(sym, run_date))
-            pct_close.append(pd.NA)
-            target_hits.append(False)
-            stop_hits.append(False)
-            first_hits.append("SKIP")
-            first_hit_times.append("reco_after_close")
-            hit_latency_minutes.append(pd.NA)
-            target_overshoot_pct.append(pd.NA)
-            best_exit_price_after_target.append(pd.NA)
-            best_exit_time_after_target.append("")
-            best_exit_from_entry_pct.append(pd.NA)
-            best_exit_from_target_pct.append(pd.NA)
-            best_exit_latency_minutes.append(pd.NA)
-            continue
+            # Local testing override: treat late-run recommendations as if they were made at session_start
+            if IS_LOCAL and EVAL_CLAMP_LATE_RECO:
+                reco_dt = session_start
+            else:
+                outcomes.append("⛔ Skipped (Late Recommendation)")
+                day_highs.append(pd.NA)
+                day_lows.append(pd.NA)
+                closes.append(_get_close_for_date(sym, run_date))
+                pct_close.append(pd.NA)
+                target_hits.append(False)
+                stop_hits.append(False)
+                first_hits.append("SKIP")
+                first_hit_times.append("reco_after_close")
+                hit_latency_minutes.append(pd.NA)
+                target_overshoot_pct.append(pd.NA)
+                best_exit_price_after_target.append(pd.NA)
+                best_exit_time_after_target.append("")
+                best_exit_from_entry_pct.append(pd.NA)
+                best_exit_from_target_pct.append(pd.NA)
+                best_exit_latency_minutes.append(pd.NA)
+                continue
 
         close_price = _get_close_for_date(sym, run_date)
         closes.append(close_price)
@@ -718,6 +734,21 @@ def evaluate_rows(df_in: pd.DataFrame, run_date: str) -> pd.DataFrame:
         if intraday is None or intraday.empty:
             day_highs.append(pd.NA)
             day_lows.append(pd.NA)
+
+            if close_price is None:
+                target_hits.append(False)
+                stop_hits.append(False)
+                first_hits.append("NO_DATA")
+                first_hit_times.append("no_intraday_no_close")
+                hit_latency_minutes.append(pd.NA)
+                target_overshoot_pct.append(pd.NA)
+                best_exit_price_after_target.append(pd.NA)
+                best_exit_time_after_target.append("")
+                best_exit_from_entry_pct.append(pd.NA)
+                best_exit_from_target_pct.append(pd.NA)
+                best_exit_latency_minutes.append(pd.NA)
+                outcomes.append("⛔ No Data (Market Closed / Holiday)")
+                continue
 
             if not EVAL_FALLBACK_STRICT:
                 if close_price is not None and target is not None and target > 0 and close_price >= target:
@@ -1129,6 +1160,84 @@ def build_weekly_excel(perf_log_csv: str, now: datetime) -> Tuple[str, int, int]
     return weekly_excel, int(len(wdf7)), int(len(wdf))
 
 
+def _baseline_narrative_from_stats(run_date: str, prem_s: dict, mid_s: dict, all_s: dict) -> str:
+    evaluated = int(all_s.get("evaluated", 0) or 0)
+    wins = int(all_s.get("wins", 0) or 0)
+    losses = int(all_s.get("losses", 0) or 0)
+    not_hit = int(all_s.get("not_hit", 0) or 0)
+    win_rate = float(all_s.get("win_rate", 0.0) or 0.0)
+
+    if evaluated <= 0:
+        return "\n".join([
+            "- What happened: No evaluated trades in stats.",
+            "- What worked: not provided",
+            "- What didn’t: not provided",
+            "- Tomorrow tweak: Verify evaluation rows are being written.",
+        ])
+
+    return "\n".join([
+        f"- What happened: evaluated={evaluated}, wins={wins}, losses={losses}, not_hit={not_hit}, win_rate={win_rate:.2f}%.",
+        "- What worked: Wins indicate some follow-through to targets.",
+        "- What didn’t: Not-hit/stop outcomes indicate incomplete follow-through or adverse moves.",
+        "- Tomorrow tweak: Keep parameters stable unless this repeats across multiple sessions.",
+    ])
+
+
+def safe_llm_daily_narrative(run_date: str, prem_s: dict, mid_s: dict, all_s: dict) -> str:
+    """
+    Bulletproof narrative:
+    - Skip LLM if nothing evaluated (saves tokens + avoids nonsense)
+    - Fallback if LLM returns empty / tool-failure text
+    - Fallback if output is weak ("not provided" spam)
+    - Enforce strict 4-bullet structure (starts-with, in order)
+    - Cap length to keep emails clean
+    """
+    # (2) Skip LLM entirely if nothing was evaluated
+    if int(all_s.get("evaluated", 0) or 0) <= 0:
+        return _baseline_narrative_from_stats(run_date, prem_s, mid_s, all_s)
+
+    try:
+        out = llm_daily_narrative(run_date, prem_s, mid_s, all_s)
+
+        # Empty output -> baseline
+        if not str(out or "").strip():
+            return _baseline_narrative_from_stats(run_date, prem_s, mid_s, all_s)
+
+        out_str = str(out).strip()
+
+        # Tool-failure text -> baseline
+        if out_str.lower().startswith("llm unavailable"):
+            return _baseline_narrative_from_stats(run_date, prem_s, mid_s, all_s)
+
+        # Weak output guard: too many "not provided"
+        np_count = sum("not provided" in ln.lower() for ln in out_str.splitlines())
+        if np_count >= 3:
+            return _baseline_narrative_from_stats(run_date, prem_s, mid_s, all_s)
+
+        # (1) Enforce strict structure: 4 bullets, in order, must START WITH the required prefixes
+        lines = [ln.strip() for ln in out_str.splitlines() if ln.strip()]
+        required = [
+            "- What happened:",
+            "- What worked:",
+            "- What didn’t:",
+            "- Tomorrow tweak:",
+        ]
+        if len(lines) < 4 or any(not lines[i].startswith(required[i]) for i in range(4)):
+            return _baseline_narrative_from_stats(run_date, prem_s, mid_s, all_s)
+
+        # Keep only the first 4 bullets (prevents extra rambling)
+        out_clean = "\n".join(lines[:4]).strip()
+
+        # Cap length (email safety)
+        if len(out_clean) > 1200:
+            out_clean = "\n".join(out_clean.splitlines()[:4]).strip()
+
+        return out_clean
+
+    except Exception:
+        return _baseline_narrative_from_stats(run_date, prem_s, mid_s, all_s)
+
+
 # -----------------------------
 # Postmarket runner
 # -----------------------------
@@ -1254,14 +1363,14 @@ def run_postmarket(now: datetime | None = None) -> None:
 
     narrative = ""
     LLM_ENABLED = os.getenv("LLM_ENABLED", "1") == "1"
-    if LLM_ENABLED and int(all_s.get("evaluated", 0) or 0) > 0:
-        narrative = llm_daily_narrative(run_date, prem_s, mid_s, all_s)
+    if LLM_ENABLED:
+        narrative = safe_llm_daily_narrative(run_date, prem_s, mid_s, all_s)
 
     if narrative:
         summary_html += f"<h3>🧠 LLM Narrative</h3><pre>{_html.escape(narrative)}</pre>"
 
     coach = ""
-    if LLM_ENABLED and int(all_s.get("evaluated", 0) or 0) > 0:
+    if LLM_ENABLED:
         coach = safe_postmarket_coach(run_date, prem_s, mid_s, all_s)
 
     if coach:

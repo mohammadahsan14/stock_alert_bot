@@ -112,7 +112,54 @@ def _midday_email_marker(now: datetime) -> Path:
     d = run_dir(now, "midday")
     run_date = now.strftime("%Y-%m-%d")
     return d / f"email_sent_{run_date}.txt"
+###________
 
+def _baseline_coach_from_stats(run_date: str, prem_s: dict, mid_s: dict, all_s: dict) -> str:
+    try:
+        evaluated = int(all_s.get("evaluated", 0) or 0)
+        wins = int(all_s.get("wins", 0) or 0)
+        losses = int(all_s.get("losses", 0) or 0)
+        not_hit = int(all_s.get("not_hit", 0) or 0)
+        win_rate = float(all_s.get("win_rate", 0.0) or 0.0)
+    except Exception:
+        evaluated, wins, losses, not_hit, win_rate = 0, 0, 0, 0, 0.0
+
+    if evaluated <= 0:
+        return "\n".join([
+            "- What happened: No evaluated trades in stats.",
+            "- Likely loss drivers: not provided",
+            "- What worked: not provided",
+            "- Next-session process tweak: Verify that evaluation rows are being written to performance_log.",
+            "- Risk control tweak: Keep risk minimal until evaluation data is stable.",
+        ])
+
+    stop_rate = (losses / evaluated * 100.0) if evaluated else 0.0
+    not_hit_rate = (not_hit / evaluated * 100.0) if evaluated else 0.0
+
+    # Deterministic, neutral language (no “you should”)
+    likely_driver = "Many setups did not reach targets within the session window." if not_hit_rate >= 50 else "Mixed follow-through; some setups did not complete."
+    worked = "Low stop-hit rate suggests risk containment held." if losses == 0 else "Stops triggered, indicating adverse moves were contained."
+
+    tweak_parts = []
+    if not_hit_rate >= 60:
+        tweak_parts.append("Tighten time-scaled targets (esp. midday) or skip late recommendations.")
+    if stop_rate >= 40:
+        tweak_parts.append("Increase selectivity: raise confidence gate for the weaker session or reduce noisy movers.")
+    if not tweak_parts:
+        tweak_parts.append("Keep parameters stable; collect more samples before changing thresholds.")
+
+    risk_parts = []
+    if evaluated < 6:
+        risk_parts.append("Small sample size: keep position sizing conservative.")
+    risk_parts.append("Cap number of midday trades when time-left is low.")
+
+    return "\n".join([
+        f"- What happened: evaluated={evaluated}, wins={wins}, losses={losses}, not_hit={not_hit}, win_rate={win_rate:.2f}%.",
+        f"- Likely loss drivers: {likely_driver}",
+        f"- What worked: {worked}",
+        f"- Next-session process tweak: {' '.join(tweak_parts)}",
+        f"- Risk control tweak: {' '.join(risk_parts)}",
+    ])
 
 # -----------------------------
 # Email routing (env-aware)
@@ -673,6 +720,7 @@ def append_recommendations_log(df_reco: pd.DataFrame, now: datetime, mode: str) 
 
 DAILY_LOG_CSV = out_path("daily_stock_log.csv", kind="logs")
 ensure_csv_exists(DAILY_LOG_CSV, [
+    "run_ts",
     "run_date", "mode", "symbol", "price_category",
     "current", "predicted_price", "target_price", "stop_loss",
     "forecast_trend", "forecast_atr", "forecast_reason",
@@ -693,6 +741,7 @@ def append_daily_log(final_view_df: pd.DataFrame, now: datetime, mode: str) -> N
     run_date = now.strftime("%Y-%m-%d")
 
     cols = [
+        "run_ts",
         "run_date", "mode", "symbol", "price_category",
         "current", "predicted_price", "target_price", "stop_loss",
         "forecast_trend", "forecast_atr", "forecast_reason",
@@ -702,6 +751,7 @@ def append_daily_log(final_view_df: pd.DataFrame, now: datetime, mode: str) -> N
     ]
 
     out = final_view_df.copy()
+    out["run_ts"] = now.strftime("%Y-%m-%d %H:%M:%S")
     out["run_date"] = run_date
     out["mode"] = mode
 
