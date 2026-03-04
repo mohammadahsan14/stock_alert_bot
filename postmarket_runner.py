@@ -122,7 +122,7 @@ def send_email(subject: str, html_body: str, attachment_path: str | None = None)
 
 
 def send_postmarket_email_once(now: datetime, subject: str, html_body: str, attachment_path: str | None = None) -> bool:
-    sent_flag = Path(run_dir(now, "postmarket")) / f"email_sent_{now.strftime('%Y%m%d')}.txt"
+    sent_flag = Path(run_dir(now, "postmarket")) / f"email_sent_{now.strftime('%Y-%m-%d')}.txt"
     if sent_flag.exists():
         print("📩 Postmarket email already sent for this run_date — skipping resend.")
         return False
