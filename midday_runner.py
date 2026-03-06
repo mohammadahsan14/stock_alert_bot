@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from llm.explain import safe_explain_pick
-
+from context_insight import build_key_insight
 import os
 import re
 import html as _html
@@ -10,7 +10,6 @@ from datetime import datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import List, Optional
-
 import pandas as pd
 import yfinance as yf
 from openpyxl import load_workbook
@@ -25,11 +24,14 @@ from config import (
     EMAIL_SUBJECT_PREFIX_LOCAL,
     EMAIL_SUBJECT_PREFIX_PROD,
     TOP_N,
+    SUDDEN_MOVER_PCT_THRESHOLD,
+    SUDDEN_MOVER_MIN_CONFIDENCE,
     SCORE_HIGH,
     SCORE_MEDIUM,
     MAX_PRICE,
     ELITE_SCORE_OVERRIDE,
     ELITE_CONF_OVERRIDE,
+
 )
 
 from email_sender import send_email as _send_email
@@ -51,8 +53,9 @@ MIDDAY_DEBUG = os.getenv("MIDDAY_DEBUG", "0") == "1"
 POS_WORDS = {"beat", "strong", "growth", "surge", "upgrade", "raises", "record", "profit", "wins", "bull"}
 NEG_WORDS = {"miss", "drop", "loss", "cuts", "downgrade", "falls", "weak", "lawsuit", "plunge", "bear"}
 
-SUDDEN_MOVER_PCT_THRESHOLD = float(os.getenv("SUDDEN_MOVER_PCT_THRESHOLD", "2.0"))
-MIDDAY_MIN_CONFIDENCE = int(os.getenv("MIDDAY_MIN_CONFIDENCE", "5"))
+# 🔒 LOCKED (single source of truth from config.py)
+MIDDAY_MIN_CONFIDENCE = int(SUDDEN_MOVER_MIN_CONFIDENCE)
+CONF_GATE = int(SUDDEN_MOVER_MIN_CONFIDENCE)
 
 # Guardrails for forecast sanity (long-only)
 FORECAST_TARGET_MAX_MULT = float(os.getenv("FORECAST_TARGET_MAX_MULT", "1.20"))  # target <= 20% above entry
@@ -64,8 +67,19 @@ MIDDAY_LLM_TOP_N = int(os.getenv("MIDDAY_LLM_TOP_N", "10"))
 
 # FINAL view controls
 FINAL_VIEW_TOP_N = int(os.getenv("FINAL_VIEW_TOP_N", "3"))
-CONF_GATE = int(os.getenv("CONF_GATE", str(MIDDAY_MIN_CONFIDENCE)))
 
+
+# Volume confirmation (optional)
+USE_VOLUME_FILTER = os.getenv("USE_VOLUME_FILTER", "0") == "1"
+VOL_LOOKBACK_DAYS = int(os.getenv("VOL_LOOKBACK_DAYS", "20"))
+VOL_RATIO_MIN = float(os.getenv("VOL_RATIO_MIN", "1.20"))   # e.g., 1.2x avg volume
+VOL_CONF_BONUS = int(os.getenv("VOL_CONF_BONUS", "1"))      # +1 conf if confirmed
+VOL_CONF_PENALTY = int(os.getenv("VOL_CONF_PENALTY", "1"))  # -1 conf if not confirmed
+
+#
+MIN_PRICE = float(os.getenv("MIN_PRICE", "5"))
+MIN_AVG_DOLLAR_VOL = float(os.getenv("MIN_AVG_DOLLAR_VOL", "20000000"))  # $20M
+#
 
 # -----------------------------
 # Output helpers (env-aware)
@@ -161,6 +175,22 @@ def _baseline_coach_from_stats(run_date: str, prem_s: dict, mid_s: dict, all_s: 
         f"- Risk control tweak: {' '.join(risk_parts)}",
     ])
 
+def get_avg_dollar_volume(symbol: str, lookback_days: int = 20) -> Optional[float]:
+    """
+    avg_dollar_volume = mean(Close * Volume) over last N trading days.
+    """
+    try:
+        hist = yf.Ticker(symbol).history(period=f"{max(lookback_days, 10) + 10}d", auto_adjust=False)
+        if hist is None or hist.empty:
+            return None
+        hist = hist.dropna(subset=["Close", "Volume"]).tail(lookback_days)
+        if hist.empty:
+            return None
+        dv = (hist["Close"] * hist["Volume"]).mean()
+        return float(dv) if dv and dv > 0 else None
+    except Exception:
+        return None
+
 # -----------------------------
 # Email routing (env-aware)
 # -----------------------------
@@ -253,8 +283,8 @@ def write_midday_excel(
 # -----------------------------
 def _ensure_llm_col(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy() if df is not None else pd.DataFrame()
-    if "llm_explanation" not in df.columns:
-        df["llm_explanation"] = ""
+    if "llm_insights" not in df.columns:
+        df["llm_insights"] = ""
     return df
 
 
@@ -268,25 +298,42 @@ def _llm_num_or_np(x) -> float | str:
 
 def _apply_llm_explanations(df: pd.DataFrame, *, horizon: str, top_n: int | None) -> pd.DataFrame:
     df = _ensure_llm_col(df)
-    if not LLM_ENABLED or df.empty:
+    if not LLM_ENABLED or df is None or df.empty:
         return df
 
     n = len(df) if top_n is None else min(int(top_n), len(df))
     idx = df.head(n).index
 
+    def _num_or_none(x):
+        v = pd.to_numeric(x, errors="coerce")
+        return None if pd.isna(v) else float(v)
+
+    def _int_or_zero(x) -> int:
+        v = pd.to_numeric(x, errors="coerce")
+        return int(v) if pd.notna(v) else 0
+
+    def _float_or_zero(x) -> float:
+        v = pd.to_numeric(x, errors="coerce")
+        return float(v) if pd.notna(v) else 0.0
+
+    def _pos_size_or_none():
+        v = pd.to_numeric(os.getenv("DEFAULT_POSITION_SIZE_USD", ""), errors="coerce")
+        return None if pd.isna(v) or float(v) <= 0 else float(v)
+
     def _row_payload(r: pd.Series) -> dict:
         return {
             "symbol": str(r.get("symbol", "")).upper().strip(),
-            "decision": str(r.get("decision", "")),
-            "score": int(pd.to_numeric(r.get("score"), errors="coerce") or 0),
-            "confidence": int(pd.to_numeric(r.get("confidence"), errors="coerce") or 0),
-            "pct_change": float(pd.to_numeric(r.get("pct_change"), errors="coerce") or 0.0),
+            "decision": str(r.get("decision", "")).strip(),
 
-            "current": _llm_num_or_np(r.get("current")),
-            "predicted_price": _llm_num_or_np(r.get("predicted_price")),
-            "target_price": _llm_num_or_np(r.get("target_price")),
-            "stop_loss": _llm_num_or_np(r.get("stop_loss")),
-            "forecast_atr": _llm_num_or_np(r.get("forecast_atr")),
+            "score": _int_or_zero(r.get("score")),
+            "confidence": _int_or_zero(r.get("confidence")),
+            "pct_change": _float_or_zero(r.get("pct_change")),
+
+            "current": _num_or_none(r.get("current")),
+            "predicted_price": _num_or_none(r.get("predicted_price")),
+            "target_price": _num_or_none(r.get("target_price")),
+            "stop_loss": _num_or_none(r.get("stop_loss")),
+            "forecast_atr": _num_or_none(r.get("forecast_atr")),
 
             "forecast_trend": str(r.get("forecast_trend") or ""),
             "forecast_reason": str(r.get("forecast_reason") or ""),
@@ -296,12 +343,15 @@ def _apply_llm_explanations(df: pd.DataFrame, *, horizon: str, top_n: int | None
             "reasons": str(r.get("reasons") or ""),
 
             "horizon": horizon,
-            "position_size_usd": float(os.getenv("DEFAULT_POSITION_SIZE_USD", "0") or 0) or "not provided",
-            "holding_window": "intraday",
-            "conf_gate": CONF_GATE,
+            "position_size_usd": _pos_size_or_none(),
+            "holding_window": str(r.get("holding_window") or horizon or "intraday"),
+            "conf_gate": int(CONF_GATE),
+
+            "stance": str(r.get("stance") or ""),
+            "stance_reason": str(r.get("stance_reason") or ""),
         }
 
-    df.loc[idx, "llm_explanation"] = df.loc[idx].apply(
+    df.loc[idx, "llm_insights"] = df.loc[idx].apply(
         lambda r: str(safe_explain_pick(_row_payload(r)) or "").strip(),
         axis=1
     )
@@ -319,6 +369,32 @@ def _safe_float(x) -> Optional[float]:
     except Exception:
         return None
 
+def _volatility_target_stop(r: pd.Series) -> tuple[Optional[float], Optional[float]]:
+    """
+    Volatility-aware target/stop:
+      target = current + 0.80 * ATR
+      stop   = current - 0.60 * ATR
+    Falls back to existing target/stop/predicted if ATR missing.
+    """
+    entry = _safe_float(r.get("current"))
+    atr = _safe_float(r.get("forecast_atr"))
+
+    tgt = _safe_float(r.get("target_price"))
+    stp = _safe_float(r.get("stop_loss"))
+
+    if entry is not None and entry > 0 and atr is not None and atr > 0:
+        return (entry + (0.80 * atr), entry - (0.60 * atr))
+
+    if tgt is None and r.get("predicted_price") is not None:
+        tgt = _safe_float(r.get("predicted_price"))
+
+    if stp is None and entry is not None and entry > 0:
+        stp = entry * 0.98
+
+    if tgt is None and entry is not None and entry > 0:
+        tgt = entry * 1.01
+
+    return tgt, stp
 
 def _entry_range(cur: Optional[float], atr: Optional[float]) -> tuple[Optional[float], Optional[float]]:
     if cur is None or cur <= 0:
@@ -410,7 +486,7 @@ def _build_final_view(pass_df: pd.DataFrame, all_df: pd.DataFrame) -> pd.DataFra
         "forecast_trend", "forecast_atr", "forecast_reason",
         "score", "score_label", "confidence", "decision",
         "news_flag", "main_news_title", "main_news_link",
-        "reasons", "llm_explanation",
+        "reasons", "llm_insights",
     ]
 
     def _ensure(df: pd.DataFrame) -> pd.DataFrame:
@@ -494,7 +570,7 @@ def news_flag_from_headlines(headlines: List[str]) -> str:
 
 
 def get_market_snapshot() -> dict:
-    out = {"trend": "up", "spy_gap_pct": 0.0, "vix": None}
+    out = {"trend": "up", "spy_gap_pct": 0.0, "vix": None, "regime": "unknown"}
     try:
         spy = yf.Ticker("SPY").history(period="2d", auto_adjust=False)
         if not spy.empty and len(spy) >= 2:
@@ -510,8 +586,47 @@ def get_market_snapshot() -> dict:
             out["vix"] = float(vix["Close"].iloc[-1])
     except Exception:
         pass
+    try:
+        v = out.get("vix")
+        t = out.get("trend")
+        if v is None:
+            out["regime"] = "unknown"
+        elif v >= 25:
+            out["regime"] = "risk_off"
+        elif t == "up":
+            out["regime"] = "risk_on"
+        else:
+            out["regime"] = "neutral"
+    except Exception:
+        pass
+
     return out
 
+def get_volume_ratio(symbol: str, lookback_days: int = 20) -> Optional[float]:
+    """
+    volume_ratio = today's volume / avg(volume over last N days)
+    Uses yfinance. Returns None if unavailable.
+    """
+    try:
+        hist = yf.Ticker(symbol).history(period=f"{max(lookback_days, 5) + 5}d", auto_adjust=False)
+        if hist is None or hist.empty or "Volume" not in hist.columns:
+            return None
+
+        vol = hist["Volume"].dropna()
+        if len(vol) < 3:
+            return None
+
+        today_vol = float(vol.iloc[-1])
+        # average of prior N days (exclude today)
+        prev = vol.iloc[:-1].tail(lookback_days)
+        if prev.empty:
+            return None
+        avg = float(prev.mean())
+        if avg <= 0:
+            return None
+        return today_vol / avg
+    except Exception:
+        return None
 
 def compute_confidence(score_val: int, pct_change: float, market_trend: str, news_flag: str) -> int:
     score_val = max(0, min(int(score_val), 100))
@@ -526,6 +641,71 @@ def compute_confidence(score_val: int, pct_change: float, market_trend: str, new
     conf = int(base + market_bonus + news_bonus - vol_penalty)
     return max(1, min(conf, 10))
 
+def _expected_rr(entry: float | None, target: float | None, stop: float | None) -> float | None:
+    try:
+        if entry is None or target is None or stop is None:
+            return None
+        entry = float(entry); target = float(target); stop = float(stop)
+        if entry <= 0:
+            return None
+        reward = target - entry
+        risk = entry - stop
+        if risk <= 0:
+            return None
+        return reward / risk
+    except Exception:
+        return None
+
+
+def _win_probability(
+    *,
+    score: int,
+    conf: int,
+    rr: float | None,
+    trend: str,
+    news_flag: str,
+    market_regime: str,
+) -> int:
+    """
+    Deterministic win probability estimate (0–100).
+    Uses only already-known features (no ML, no randomness).
+    """
+    # base from confidence (conf 1..10)
+    p = 35 + (int(conf) * 4)  # conf 5 => 55, conf 6 => 59, conf 7 => 63
+
+    # score contribution (centered around 60)
+    p += int((int(score) - 60) * 0.6)  # score 70 => +6, score 50 => -6
+
+    # trend
+    t = (trend or "").lower()
+    if t == "up":
+        p += 3
+    elif t == "down":
+        p -= 4
+
+    # news flag
+    if news_flag == "🟢":
+        p += 2
+    elif news_flag == "🔴":
+        p -= 5
+
+    # market regime
+    if market_regime == "risk_on":
+        p += 2
+    elif market_regime == "risk_off":
+        p -= 6
+
+    # rr adjustment (prefer >= 1.2)
+    if rr is not None:
+        if rr >= 1.8:
+            p += 4
+        elif rr >= 1.4:
+            p += 2
+        elif rr < 1.0:
+            p -= 4
+
+    return int(max(1, min(99, round(p))))
+
 
 def _default_target_stop(entry: float, conf: int) -> tuple[float, float]:
     conf = int(conf) if conf is not None else 5
@@ -535,6 +715,7 @@ def _default_target_stop(entry: float, conf: int) -> tuple[float, float]:
 
 
 def _sanitize_forecast_levels(
+
     entry: float,
     conf: int,
     pred: Optional[float],
@@ -634,6 +815,17 @@ def build_midday_alert(final_view_df: pd.DataFrame, run_date: str) -> str:
 
         plan = _html.escape(str(r.get("plan_card") or ""))[:900].replace("\n", "<br>")
 
+        ki = _html.escape(str(r.get("key_insight") or ""))[:500].replace("\n", "<br>")
+        ins = _html.escape(str(r.get("llm_insights") or ""))[:600].replace("\n", "<br>")
+
+        winp = _html.escape(str(r.get("win_prob", "")))
+        rr = r.get("expected_rr")
+        rr_txt = ""
+        try:
+            rr_txt = f"{float(rr):.2f}" if rr is not None and not pd.isna(rr) else ""
+        except Exception:
+            rr_txt = ""
+
         return f"""
         <tr>
           <td><b>{sym}</b></td>
@@ -647,23 +839,27 @@ def build_midday_alert(final_view_df: pd.DataFrame, run_date: str) -> str:
           <td>{stance}<br><span style="color:#666;font-size:11px;">{stance_reason}</span></td>
           <td><a href="{link}" target="_blank">{title}</a></td>
           <td style="color:#444;">{reasons}</td>
-          <td style="color:#222;">{plan}</td>
+          <td style="color:#222;white-space:normal;">{plan}</td>
+          <td style="color:#555;white-space:normal;">{ki}</td>
+          <td style="color:#555;white-space:normal;">{ins}</td>
+          <td>{winp}</td>
+          <td>{rr_txt}</td>
         </tr>
         """
 
     rows = "\n".join([row_html(r) for _, r in df2.iterrows()])
-    mode_note = "Qualified Picks (GO)" if (df2.get("stance") == "GO").any() else "High Vote Watchlist (WATCH)"
-
+    mode_note = "Qualified Picks (GO)" if (
+                "stance" in df2.columns and (df2["stance"] == "GO").any()) else "High Vote Watchlist (WATCH)"
     return f"""
     <h2>⚡ Midday Sudden Movers ({run_date})</h2>
     <p><b>Mode:</b> {mode_note}</p>
-    <p>Filters: abs(move)≥{SUDDEN_MOVER_PCT_THRESHOLD}%, conf≥{MIDDAY_MIN_CONFIDENCE}, price≤${MAX_PRICE} (elite override allowed).</p>
+    <p>Filters: abs(move)≥{SUDDEN_MOVER_PCT_THRESHOLD}%, conf≥{CONF_GATE}, price≤${MAX_PRICE} (elite override allowed).</p>
     <p><b>Win rule (postmarket):</b> target hit anytime after recommendation (intraday high ≥ target).</p>
 
     <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Arial;font-size:13px;">
       <tr style="background:#eee;">
         <th>Symbol</th><th>Price</th><th>%</th><th>Pred</th><th>Target</th><th>Stop</th>
-        <th>Score</th><th>Conf</th><th>Stance</th><th>Headline</th><th>Reasons</th><th>Plan Card (Locked)</th>
+        <th>Score</th><th>Conf</th><th>Stance</th><th>Headline</th><th>Reasons</th><th>Plan Card (Locked)</th><th>Key Insight</th><th>Insights</th><th>Win%</th><th>Exp R:R</th>
       </tr>
       {rows}
     </table>
@@ -690,6 +886,12 @@ def append_recommendations_log(df_reco: pd.DataFrame, now: datetime, mode: str) 
         return
 
     out = df_reco.copy()
+
+    # ✅ prevent insert collisions if columns already exist
+    for c in ["run_ts", "run_date", "mode", "app_env"]:
+        if c in out.columns:
+            out = out.drop(columns=[c])
+
     out.insert(0, "run_ts", now.strftime("%Y-%m-%d %H:%M:%S"))
     out.insert(1, "run_date", now.strftime("%Y-%m-%d"))
     out.insert(2, "mode", mode)
@@ -726,9 +928,22 @@ ensure_csv_exists(DAILY_LOG_CSV, [
     "forecast_trend", "forecast_atr", "forecast_reason",
     "trade_plan", "earnings_risk",
     "decision", "score", "score_label", "confidence",
-    "reasons", "llm_explanation", "news_flag", "main_news_title", "main_news_link",
+    "reasons", "llm_insights", "news_flag", "main_news_title", "main_news_link",
+    "stance", "stance_reason", "vote_score",
+    "plan_card",
+    "key_insight",
+    "win_prob",
+    "expected_rr",
 ])
 
+def _clean_text_cell(x) -> str:
+    s = "" if x is None else str(x)
+    s = s.replace("\uFFFC", "").strip()
+    # remove trailing excel-ish refs: 'SHEET'!1:6, A12, 1:4, etc.
+    s = re.sub(r"\s*'[^']+'!\d+:\d+\s*$", "", s).strip()
+    s = re.sub(r"\s*\b[A-Z]{1,3}\d+\b\s*$", "", s).strip()
+    s = re.sub(r"\s*\b\d+:\d+\b\s*$", "", s).strip()
+    return s
 
 def append_daily_log(final_view_df: pd.DataFrame, now: datetime, mode: str) -> None:
     """
@@ -746,8 +961,10 @@ def append_daily_log(final_view_df: pd.DataFrame, now: datetime, mode: str) -> N
         "current", "predicted_price", "target_price", "stop_loss",
         "forecast_trend", "forecast_atr", "forecast_reason",
         "trade_plan", "earnings_risk",
-        "decision", "score", "score_label", "confidence",
-        "reasons", "llm_explanation", "news_flag", "main_news_title", "main_news_link",
+        "decision", "win_prob", "expected_rr","score", "score_label", "confidence",
+        "reasons", "llm_insights", "news_flag", "main_news_title", "main_news_link",
+        "stance", "stance_reason", "vote_score",
+        "plan_card","key_insight",
     ]
 
     out = final_view_df.copy()
@@ -775,6 +992,29 @@ def append_daily_log(final_view_df: pd.DataFrame, now: datetime, mode: str) -> N
     merged = merged.drop_duplicates(subset=["run_date", "mode", "symbol"], keep="last")
     merged.to_csv(DAILY_LOG_CSV, index=False)
 
+
+def _insight_payload(r: pd.Series) -> dict:
+    d = r.to_dict()
+
+    conf = int(pd.to_numeric(d.get("confidence"), errors="coerce") or 0)
+    gate = int(CONF_GATE)
+
+    d["confidence"] = conf
+    d["conf_gate"] = gate
+    d["min_confidence_to_trade"] = gate
+    d["is_tradeable"] = conf >= gate
+
+    vs = d.get("vote_score")
+    if vs is None or (isinstance(vs, float) and pd.isna(vs)):
+        d["vote_score"] = 0
+    else:
+        d["vote_score"] = int(pd.to_numeric(vs, errors="coerce") or 0)
+
+    # ensure stance exists (FINAL_VIEW has it; others may not)
+    if not d.get("stance"):
+        d["stance"] = "WATCH"
+
+    return d
 
 # -----------------------------
 # Midday runner
@@ -825,7 +1065,31 @@ def run_midday(now: datetime | None = None) -> None:
     raw_df["current"] = pd.to_numeric(raw_df.get("current"), errors="coerce").fillna(10**9)
 
     thr_df = raw_df[raw_df["pct_change"].abs() >= SUDDEN_MOVER_PCT_THRESHOLD].copy()
-    thr_df.to_csv(Path(rf) / "midday_after_threshold.csv", index=False)
+
+    if MIDDAY_DEBUG:
+        thr_df.to_csv(Path(rf) / "midday_after_threshold.csv", index=False)
+
+    # ✅ Liquidity filter (runs AFTER threshold, BEFORE scoring loop)
+    if not thr_df.empty:
+        liq_cache: dict[str, Optional[float]] = {}
+        keep_rows = []
+
+        for _, r in thr_df.iterrows():
+            sym = str(r.get("symbol", "")).upper().strip()
+            price = float(r.get("current", 0.0) or 0.0)
+            if price < MIN_PRICE:
+                continue
+
+            if sym not in liq_cache:
+                liq_cache[sym] = get_avg_dollar_volume(sym, lookback_days=20)
+
+            adv = liq_cache[sym]
+            if adv is None or adv < MIN_AVG_DOLLAR_VOL:
+                continue
+
+            keep_rows.append(r)
+
+        thr_df = pd.DataFrame(keep_rows)
 
     if thr_df.empty:
         write_midday_excel(
@@ -838,7 +1102,7 @@ def run_midday(now: datetime | None = None) -> None:
         )
         html = f"""
         <h2>⚡ Midday Sudden Movers ({run_date})</h2>
-        <p>No movers exceeded threshold {SUDDEN_MOVER_PCT_THRESHOLD}%.</p>
+        <p>No movers passed threshold + liquidity filters (abs(move)≥{SUDDEN_MOVER_PCT_THRESHOLD}%, price≥${MIN_PRICE}, avg $vol≥${int(MIN_AVG_DOLLAR_VOL):,}).</p>
         <p><b>Attachment:</b> Excel included with sheets: FINAL_VIEW (empty), PASS (empty), ALL_CANDIDATES, AFTER_THRESHOLD.</p>
         """
         if send_email(f"⚡ Sudden Movers Alert ({run_date})", html, attachment_path=excel_path):
@@ -847,16 +1111,29 @@ def run_midday(now: datetime | None = None) -> None:
 
     snapshot = get_market_snapshot()
     market_trend = snapshot.get("trend", "up")
+    market_regime = snapshot.get("regime", "unknown")
 
     scores, labels, reasons_list, confs, decisions = [], [], [], [], []
     titles, links, flags = [], [], []
     preds, tgts, stps, ftrends, fatrs, freasons = [], [], [], [], [], []
     dbg_rows = []
 
+    vol_ratios = []
+    vol_cache: dict[str, Optional[float]] = {}
+
     for _, row in thr_df.iterrows():
         sym = str(row.get("symbol", "")).upper().strip()
         current = float(row.get("current", 0.0) or 0.0)
         pct_change = float(row.get("pct_change", 0.0) or 0.0)
+
+        # --- Volume confirmation (optional) ---
+        vol_ratio = None
+        if USE_VOLUME_FILTER:
+            if sym in vol_cache:
+                vol_ratio = vol_cache[sym]
+            else:
+                vol_ratio = get_volume_ratio(sym, lookback_days=VOL_LOOKBACK_DAYS)
+                vol_cache[sym] = vol_ratio
 
         score_val, score_label, reasons = get_predictive_score_with_reasons(sym)
         score_val = int(score_val)
@@ -870,18 +1147,37 @@ def run_midday(now: datetime | None = None) -> None:
 
         conf = compute_confidence(score_val, pct_change, market_trend, flag)
 
+        if USE_VOLUME_FILTER and vol_ratio is not None:
+            if vol_ratio >= VOL_RATIO_MIN:
+                conf = min(10, int(conf) + VOL_CONF_BONUS)
+            else:
+                conf = max(1, int(conf) - VOL_CONF_PENALTY)
+
         f = forecast_price_levels(sym, current=current, score=score_val, horizon="intraday")
         raw_pred = _safe_float(getattr(f, "predicted_price", None))
         raw_tgt = _safe_float(getattr(f, "target_price", None))
         raw_stp = _safe_float(getattr(f, "stop_loss", None))
 
         pred_s, tgt_s, stp_s = _sanitize_forecast_levels(current, int(conf), raw_pred, raw_tgt, raw_stp)
-
+        # --- Volatility-aware base target/stop (Step 1) ---
+        # Use ATR if available; otherwise keep sanitized levels.
+        atr_val = _safe_float(getattr(f, "atr", None))
+        base_row = pd.Series({
+            "current": current,
+            "forecast_atr": atr_val,
+            "predicted_price": pred_s,
+            "target_price": tgt_s,
+            "stop_loss": stp_s,
+        })
+        vtgt, vstp = _volatility_target_stop(base_row)
+        tgt_s = vtgt if vtgt is not None else tgt_s
+        stp_s = vstp if vstp is not None else stp_s
         scores.append(score_val)
         labels.append(score_label)
         reasons_list.append(reasons)
         decisions.append(decision)
         confs.append(int(conf))
+        vol_ratios.append(vol_ratio if vol_ratio is not None else pd.NA)
         titles.append(title)
         links.append(link)
         flags.append(flag)
@@ -901,8 +1197,8 @@ def run_midday(now: datetime | None = None) -> None:
                 "confidence": int(conf),
                 "raw_target": raw_tgt,
                 "raw_stop": raw_stp,
-                "san_target": tgt_s,
-                "san_stop": stp_s,
+                "final_target": tgt_s,
+                "final_stop": stp_s,
             })
 
     all_df = thr_df.copy()
@@ -914,6 +1210,7 @@ def run_midday(now: datetime | None = None) -> None:
     all_df["main_news_title"] = titles
     all_df["main_news_link"] = links
     all_df["news_flag"] = flags
+    all_df["volume_ratio"] = pd.to_numeric(pd.Series(vol_ratios, index=all_df.index), errors="coerce")
 
     all_df["predicted_price"] = pd.to_numeric(pd.Series(preds, index=all_df.index), errors="coerce")
     all_df["target_price"] = pd.to_numeric(pd.Series(tgts, index=all_df.index), errors="coerce")
@@ -922,7 +1219,24 @@ def run_midday(now: datetime | None = None) -> None:
     all_df["forecast_atr"] = fatrs
     all_df["forecast_reason"] = freasons
 
-    pass_df = all_df[all_df["confidence"] >= MIDDAY_MIN_CONFIDENCE].copy()
+    pass_df = all_df[all_df["confidence"] >= CONF_GATE].copy()
+    # -----------------------------
+    # Market regime filter
+    # Avoid trades in risk-off markets unless strong signal
+    # -----------------------------
+    if market_regime == "risk_off":
+        pass_df = pass_df[pass_df["confidence"] >= (CONF_GATE + 1)]
+    elif market_regime == "neutral":
+        pass
+    elif market_regime == "risk_on":
+        pass_df = pass_df[pass_df["confidence"] >= CONF_GATE]
+
+    # debug visibility
+    if MIDDAY_DEBUG:
+        print(
+            f"📊 Market regime: {market_regime} | "
+            f"filtered_pass_count={len(pass_df)}"
+        )
     pass_df = pass_df[
         (pass_df["current"] <= MAX_PRICE) |
         ((pass_df["score"] >= ELITE_SCORE_OVERRIDE) & (pass_df["confidence"] >= ELITE_CONF_OVERRIDE))
@@ -955,24 +1269,99 @@ def run_midday(now: datetime | None = None) -> None:
     # FINAL_VIEW
     final_view_df = _build_final_view(pass_df, all_df)
 
+    # 🔒 Messaging guard: never show buy/preferable if not tradeable by gate
+    for df_ in [final_view_df, pass_df, all_df]:
+        if df_ is None or df_.empty:
+            continue
+
+        for c in ["mover_signal", "day_trade", "week_trade", "month_trade"]:
+            if c not in df_.columns:
+                df_[c] = ""
+
+        def _guard_row(r: pd.Series) -> pd.Series:
+            conf = int(pd.to_numeric(r.get("confidence"), errors="coerce") or 0)
+            decision = str(r.get("decision") or "").strip()
+            tradeable = conf >= int(CONF_GATE)
+
+            if (not tradeable) or (decision == "Not Advisable"):
+                r["mover_signal"] = "❌ AVOID / WATCH"
+                r["day_trade"] = "WATCH"
+                r["week_trade"] = "WATCH"
+                r["month_trade"] = "WATCH"
+            return r
+
+        df_.loc[:, :] = df_.apply(_guard_row, axis=1)
+
+
     # FINAL_VIEW: deterministic plan_card always present
     if not final_view_df.empty:
-        final_view_df["plan_card"] = final_view_df.apply(_plan_card_row, axis=1)
+        final_view_df["plan_card"] = final_view_df.apply(lambda r: _plan_card_row(r), axis=1)
     else:
         final_view_df = final_view_df.copy()
         final_view_df["plan_card"] = ""
 
+    # --- Win Probability + Expected R:R (deterministic) ---
+    final_view_df["expected_rr"] = final_view_df.apply(
+        lambda r: _expected_rr(
+            _safe_float(r.get("current")),
+            _safe_float(r.get("target_price")),
+            _safe_float(r.get("stop_loss")),
+        ),
+        axis=1,
+    )
+
+    final_view_df["win_prob"] = final_view_df.apply(
+        lambda r: _win_probability(
+            score=int(pd.to_numeric(r.get("score"), errors="coerce") or 0),
+            conf=int(pd.to_numeric(r.get("confidence"), errors="coerce") or 0),
+            rr=_safe_float(r.get("expected_rr")),
+            trend=str(r.get("forecast_trend") or ""),
+            news_flag=str(r.get("news_flag") or ""),
+            market_regime=str(market_regime or "unknown"),
+        ),
+        axis=1,
+    )
+
     # Optional: LLM for FINAL_VIEW only (kept but not required)
-    final_view_df = _apply_llm_explanations(final_view_df, horizon="midday_final_view", top_n=None)
+
+    # final_view_df = _apply_llm_explanations(
+    #     final_view_df,
+    #     horizon="midday_final_view",
+    #     top_n=None,
+    # )
+
+    # Key insight (deterministic)
+    for df_ in [final_view_df, pass_df, all_df]:
+        if df_ is None or df_.empty:
+            continue
+        if "key_insight" not in df_.columns:
+            df_["key_insight"] = ""
+        df_["key_insight"] = df_.apply(lambda r: build_key_insight(_insight_payload(r)), axis=1)
+
+
+    # scrub trailing artifacts AFTER everything is created
+    for df_ in [final_view_df, pass_df, all_df]:
+        if df_ is None or df_.empty:
+            continue
+        for c in ["plan_card", "llm_insights", "key_insight"]:
+            if c in df_.columns:
+                df_[c] = df_[c].apply(_clean_text_cell)
 
     if MIDDAY_DEBUG and dbg_rows:
         pd.DataFrame(dbg_rows).to_csv(Path(rf) / "debug_forecast_sanity.csv", index=False)
 
+    final_view_df["expected_rr"] = pd.to_numeric(final_view_df["expected_rr"], errors="coerce")
+    final_view_df["win_prob"] = pd.to_numeric(final_view_df["win_prob"], errors="coerce")
+
+    # FINAL_VIEW must be deterministic & never contradict stance
+    if "llm_insights" in final_view_df.columns:
+        final_view_df["llm_insights"] = ""
+
     # Logs:
     # - recommendations_log: PASS only (legacy)
     pass_df_to_log = pass_df.copy()
-    if "llm_explanation" in pass_df_to_log.columns:
-        pass_df_to_log = pass_df_to_log.drop(columns=["llm_explanation"])
+    if "llm_insights" in pass_df_to_log.columns:
+        pass_df_to_log = pass_df_to_log.drop(columns=["llm_insights"])
     append_recommendations_log(pass_df_to_log, now, mode="midday")
 
     # - daily_stock_log: FINAL_VIEW (truth for postmarket)

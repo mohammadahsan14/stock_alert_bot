@@ -126,6 +126,8 @@ def _send_resend(
         "subject": subject or "(no subject)",
         "html": html_body or "",
     })
+    if DEBUG_EMAIL:
+        print(f"📧 Resend recipients={recipients} from={_format_from(from_email)} attach={bool(attachment_path)}")
 
     params["reply_to"] = (reply_to or from_email)
 
@@ -252,6 +254,9 @@ def send_email(
     """
     provider = (os.getenv("EMAIL_PROVIDER") or "resend").strip().lower()
     fallback = (os.getenv("EMAIL_FALLBACK_TO_GMAIL") == "1")
+
+    if DEBUG_EMAIL:
+        print(f"📧 EMAIL_PROVIDER={provider} fallback_to_gmail={fallback}")
 
     if (os.getenv("EMAIL_DRY_RUN") or "").strip() == "1":
         print("🧪 EMAIL_DRY_RUN=1 (not sending)")

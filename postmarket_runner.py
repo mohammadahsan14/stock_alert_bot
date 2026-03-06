@@ -112,6 +112,8 @@ EFFECTIVE_RECEIVER_EMAIL = (LOCAL_RECEIVER_EMAIL or RECEIVER_EMAIL) if IS_LOCAL 
 
 def send_email(subject: str, html_body: str, attachment_path: str | None = None) -> bool:
     final_subject = f"{EMAIL_SUBJECT_PREFIX} {subject}"
+    print(f"📧 Sending email to={EFFECTIVE_RECEIVER_EMAIL} from={SENDER_EMAIL} subject={final_subject} attach={bool(attachment_path)}")
+
     return _send_email(
         subject=final_subject,
         html_body=html_body,
@@ -126,12 +128,18 @@ def send_postmarket_email_once(now: datetime, subject: str, html_body: str, atta
     if sent_flag.exists():
         print("📩 Postmarket email already sent for this run_date — skipping resend.")
         return False
+
     ok = send_email(subject, html_body, attachment_path)
+
+    if not ok:
+        print("⚠️ Postmarket email failed — NOT writing sent-flag (will allow retry).")
+        return False
+
     sent_flag.write_text(
         f"sent_ts={now.strftime('%Y-%m-%d %H:%M:%S')}\nrun_id={make_run_id(now)}\n",
         encoding="utf-8",
     )
-    return ok
+    return True
 
 
 # -----------------------------

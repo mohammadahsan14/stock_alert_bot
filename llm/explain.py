@@ -1,4 +1,4 @@
-# llm/explain.py (LOCKED + STRICT - quick-glance card explain + postmarket coach)
+# llm/explain.py (LOCKED + STRICT - quick-glance card explain + postmarket coach + insights)
 from __future__ import annotations
 
 import os
@@ -11,23 +11,33 @@ from .client import llm_text
 STRICT_LLM = os.getenv("STRICT_LLM", "0").strip() == "1"
 
 # Prefer phrase-level bans to avoid accidental matches like "buying pressure" / "sell-off".
-BANNED_PHRASES = [
-    "you should",
-    "you must",
-    "i recommend",
-    "recommended",
-    "recommend",
-    "preferable",
-    "good opportunity",
-    "go for it",
-    "enter now",
-    "exit now",
-    "buy now",
-    "sell now",
-    "take profit",
-    "stop out",
-    "strong buy",
-]
+BANNED_PHRASES = sorted(
+    [
+        "you should",
+        "you must",
+        "i recommend",
+        "recommended",
+        "recommend",
+        "preferable",
+        "good opportunity",
+        "go for it",
+        "enter now",
+        "exit now",
+        "buy now",
+        "sell now",
+        "take profit",
+        "stop out",
+        "strong buy",
+        "best trade",
+        "guaranteed",
+        "high probability",
+        "can't miss",
+        "must trade",
+    ],
+    key=len,
+    reverse=True,
+)
+
 _BANNED_RE = re.compile(r"|".join(re.escape(p) for p in BANNED_PHRASES), flags=re.IGNORECASE)
 
 # New quick-glance format (exactly 5 lines)
@@ -37,6 +47,14 @@ CARD_LINES = [
     "- Levels:",
     "- P/L:",
     "- Stance reason:",
+]
+
+# Insights format (exactly 4 lines)
+INSIGHT_LINES = [
+    "- Why on list:",
+    "- Main risks:",
+    "- What would improve stance:",
+    "- What to watch:",
 ]
 
 COACH_LINES = [
@@ -98,10 +116,16 @@ def _sanitize_banned_language(text: str) -> str:
     for pat, rep in replacements:
         t = re.sub(pat, rep, t, flags=re.IGNORECASE)
 
-    # Whole-word neutralization
-    t = re.sub(r"\bbuy\b", "enter", t, flags=re.IGNORECASE)
-    t = re.sub(r"\bsell\b", "exit", t, flags=re.IGNORECASE)
+    # Whole-word neutralization (avoid touching "buying", "sell-off")
+    def _neutralize_trade_words(match):
+        word = match.group(0).lower()
+        if word == "buy":
+            return "enter"
+        if word == "sell":
+            return "exit"
+        return word
 
+    t = re.sub(r"\b(buy|sell)\b", _neutralize_trade_words, t, flags=re.IGNORECASE)
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
@@ -206,7 +230,6 @@ def _time_window_bucket(row: dict, cur: float | None, atr: float | None) -> str:
     else:
         bucket = "More than week"
 
-    # confidence nudge
     try:
         conf = int(row.get("confidence"))
     except Exception:
@@ -231,7 +254,6 @@ def _stance_and_reason(row: dict) -> tuple[str, str]:
       Not Advisable -> AVOID
     Falls back to confidence if unclear.
     """
-
     decision = str(row.get("decision") or "").strip().lower()
     conf = row.get("confidence")
     score = row.get("score")
@@ -242,7 +264,6 @@ def _stance_and_reason(row: dict) -> tuple[str, str]:
     except Exception:
         conf_i = None
 
-    # --- Explicit decision mapping ---
     if "strong buy" in decision or decision in {"go", "qualified", "pick"}:
         stance = "GO"
     elif "moderate" in decision or "watch" in decision:
@@ -250,7 +271,6 @@ def _stance_and_reason(row: dict) -> tuple[str, str]:
     elif "not advisable" in decision or "avoid" in decision:
         stance = "AVOID"
     else:
-        # fallback to confidence
         if conf_i is not None and conf_i >= 7:
             stance = "GO"
         elif conf_i is not None and conf_i >= 5:
@@ -299,16 +319,15 @@ def _levels_block(row: dict) -> str:
     tgt = row.get("target_price")
     stp = row.get("stop_loss")
     try:
-        tgt_f = float(tgt)
-        tgt_s = _fmt_money(tgt_f)
+        tgt_s = _fmt_money(float(tgt))
     except Exception:
         tgt_s = "not provided"
     try:
-        stp_f = float(stp)
-        stp_s = _fmt_money(stp_f)
+        stp_s = _fmt_money(float(stp))
     except Exception:
         stp_s = "not provided"
     return f"target {tgt_s} | stop {stp_s}"
+
 
 def _baseline_coach_from_stats(run_date: str, prem_s: dict, mid_s: dict, all_s: dict) -> str:
     try:
@@ -332,9 +351,16 @@ def _baseline_coach_from_stats(run_date: str, prem_s: dict, mid_s: dict, all_s: 
     stop_rate = (losses / evaluated * 100.0) if evaluated else 0.0
     not_hit_rate = (not_hit / evaluated * 100.0) if evaluated else 0.0
 
-    # Deterministic, neutral language (no “you should”)
-    likely_driver = "Many setups did not reach targets within the session window." if not_hit_rate >= 50 else "Mixed follow-through; some setups did not complete."
-    worked = "Low stop-hit rate suggests risk containment held." if losses == 0 else "Stops triggered, indicating adverse moves were contained."
+    likely_driver = (
+        "Many setups did not reach targets within the session window."
+        if not_hit_rate >= 50
+        else "Mixed follow-through; some setups did not complete."
+    )
+    worked = (
+        "Low stop-hit rate suggests risk containment held."
+        if losses == 0
+        else "Stops triggered, indicating adverse moves were contained."
+    )
 
     tweak_parts = []
     if not_hit_rate >= 60:
@@ -357,31 +383,53 @@ def _baseline_coach_from_stats(run_date: str, prem_s: dict, mid_s: dict, all_s: 
         f"- Risk control tweak: {' '.join(risk_parts)}",
     ])
 
+
 def _baseline_card_from_row(row: dict) -> str:
-    """
-    Deterministic baseline quick-glance card (exactly 5 lines).
-    """
     entry_txt, cur, atr = _entry_range_from_row(row)
     tw = _time_window_bucket(row, cur, atr)
     lv = _levels_block(row)
     pl = _pl_block(row)
     stance, reason = _stance_and_reason(row)
 
-    return "\n".join(
-        [
-            f"- Entry range: {entry_txt}",
-            f"- Time window: {tw}",
-            f"- Levels: {lv}",
-            f"- P/L: {pl}",
-            f"- Stance reason: {stance} | {reason}",
-        ]
-    )
+    return "\n".join([
+        f"- Entry range: {entry_txt}",
+        f"- Time window: {tw}",
+        f"- Levels: {lv}",
+        f"- P/L: {pl}",
+        f"- Stance reason: {stance} | {reason}",
+    ])
 
+
+def _baseline_insights_from_row(row: dict) -> str:
+    """
+    Deterministic baseline insights (exactly 4 lines). Intentionally light on numbers.
+    """
+    sym = str(row.get("symbol") or "").upper().strip()
+    trend = str(row.get("forecast_trend") or "not provided")
+    news = str(row.get("news_flag") or "not provided")
+    reasons = str(row.get("reasons") or "").strip()
+
+    reasons_short = reasons[:160] + ("…" if len(reasons) > 160 else "")
+    why = f"{sym}: trend={trend}; news={news}; reasons={reasons_short or 'not provided'}"
+    risks = "Volatility / gap risk; market regime risk; news headline reversal risk."
+    improve = "Higher confidence vs gate; cleaner price action vs key levels; better market breadth."
+    watch = "Open behavior, first 15–30m range, and follow-through vs target/stop."
+
+    return "\n".join([
+        f"- Why on list: {why if why.strip() else 'not provided'}",
+        f"- Main risks: {risks}",
+        f"- What would improve stance: {improve}",
+        f"- What to watch: {watch}",
+    ])
+
+def _scrub_trailing_artifacts(s: str) -> str:
+    # remove artifacts like "1:6" or " 2:4"
+    return re.sub(r"\s*\b\d+:\d+\b\s*$", "", s).strip()
 
 def _force_exact_lines(text: str, labels: list[str], *, strict: bool) -> str:
     """
     Enforces EXACT output labels and line count.
-    In strict mode: sanitize + hard scrub banned phrases (no fallback on bans).
+    In strict mode: sanitize + hard scrub banned phrases.
     """
     t = _normalize_text(text)
 
@@ -390,12 +438,10 @@ def _force_exact_lines(text: str, labels: list[str], *, strict: bool) -> str:
         t = _BANNED_RE.sub("", t)
         t = re.sub(r"\s{2,}", " ", t).strip()
 
-    lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
-
+    lines = [_scrub_trailing_artifacts(ln.strip()) for ln in t.split("\n") if ln.strip()]
     if len(lines) == len(labels) and all(lines[i].startswith(labels[i]) for i in range(len(labels))):
         return "\n".join(lines)
 
-    # Salvage
     found: dict[str, str] = {}
     for ln in lines:
         for lab in labels:
@@ -405,7 +451,7 @@ def _force_exact_lines(text: str, labels: list[str], *, strict: bool) -> str:
                 break
 
     out = [f"{lab} {found.get(lab, 'not provided')}".rstrip() for lab in labels]
-    final = "\n".join(out)
+    final = "\n".join([_scrub_trailing_artifacts(x) for x in out])
 
     if strict:
         final = _sanitize_banned_language(final)
@@ -415,65 +461,65 @@ def _force_exact_lines(text: str, labels: list[str], *, strict: bool) -> str:
     return final
 
 
-def _run_with_retry(prompt: str, labels: list[str], *, max_tokens: int, row: dict | None = None) -> str:
+def _is_weak_block(text: str, labels: list[str]) -> bool:
+    t = _normalize_text(text)
+    if not t:
+        return True
+    if t.strip() == _fallback_block(labels).strip():
+        return True
+
+    lines = [_scrub_trailing_artifacts(ln.strip()) for ln in t.split("\n") if ln.strip()]
+    if len(lines) != len(labels):
+        return True
+    if not all(lines[i].startswith(labels[i]) for i in range(len(labels))):
+        return True
+
+    np_count = sum("not provided" in ln.lower() for ln in lines)
+    return np_count >= len(labels) - 2
+
+
+def _run_with_retry(
+    prompt: str,
+    labels: list[str],
+    *,
+    max_tokens: int,
+    row: dict | None = None,
+    fallback_fn=None,
+) -> str:
     """
     One retry in STRICT mode if output still malformed.
     Always enforce hallucination guard.
+    fallback_fn(row) should return a deterministic block matching 'labels'.
     """
-
     raw = llm_text(prompt, max_output_tokens=max_tokens).strip()
     out = _force_exact_lines(raw, labels, strict=STRICT_LLM)
 
-    # 🚨 Always enforce hallucination guard
     if row is not None and _llm_has_new_numbers(out, row):
-        return _baseline_card_from_row(row)
+        return fallback_fn(row) if fallback_fn else _fallback_block(labels)
 
-    if STRICT_LLM:
-        weak = (out == _fallback_block(labels)) or (
-            sum("not provided" in ln.lower() for ln in out.splitlines()) >= len(labels) - 2
-        )
+    if STRICT_LLM and _is_weak_block(out, labels):
+        raw2 = llm_text(
+            prompt + "\nFINAL WARNING: Use ONLY DATA values; keep label format exact; no invented numbers.",
+            max_output_tokens=max_tokens,
+        ).strip()
 
-        if weak:
-            raw2 = llm_text(
-                prompt
-                + "\nFINAL WARNING: Use ONLY DATA values; compute entry range and P/L only from current/ATR/target/stop; keep label format exact.",
-                max_output_tokens=max_tokens,
-            ).strip()
+        out2 = _force_exact_lines(raw2, labels, strict=STRICT_LLM)
+        if row is not None and _llm_has_new_numbers(out2, row):
+            return fallback_fn(row) if fallback_fn else _fallback_block(labels)
+        if _is_weak_block(out2, labels):
+            return fallback_fn(row) if fallback_fn else _fallback_block(labels)
+        return out2
 
-            out2 = _force_exact_lines(raw2, labels, strict=STRICT_LLM)
-
-            # 🚨 Guard again after retry
-            if row is not None and _llm_has_new_numbers(out2, row):
-                return _baseline_card_from_row(row)
-
-            weak2 = (out2 == _fallback_block(labels)) or (
-                sum("not provided" in ln.lower() for ln in out2.splitlines()) >= len(labels) - 2
-            )
-
-            if weak2:
-                return _baseline_card_from_row(row)
-
-            return out2
-
-    # Non-strict mode fallback
-    if row is not None:
-        weak = (out == _fallback_block(labels)) or (
-            sum("not provided" in ln.lower() for ln in out.splitlines()) >= len(labels) - 2
-        )
-        if weak:
-            return _baseline_card_from_row(row)
+    if _is_weak_block(out, labels):
+        return fallback_fn(row) if (row is not None and fallback_fn) else _fallback_block(labels)
 
     return out
 
 
 # -----------------------------
-# Premarket / Midday Quick-Glance Explain
+# Premarket / Midday Quick-Glance Plan Card
 # -----------------------------
 def explain_trade_plan(row: dict) -> str:
-    """
-    Produces the exact 5-line quick-glance card.
-    LLM is used as a formatter only; deterministic baseline is the source of truth.
-    """
     baseline = _baseline_card_from_row(row)
 
     prompt = f"""
@@ -489,12 +535,12 @@ BASELINE:
 {baseline}
 """.strip()
 
-    # If STRICT is on, sanitizer ensures no banned phrasing survives
     return _run_with_retry(
         prompt,
         CARD_LINES,
         max_tokens=220,
-        row={"row": row, "baseline": baseline},  # includes derived numbers for guard
+        row={**row, "baseline": baseline},
+        fallback_fn=_baseline_card_from_row,
     )
 
 
@@ -506,7 +552,42 @@ def safe_explain_pick(row: dict) -> str:
 
 
 # -----------------------------
-# Postmarket Coach (unchanged)
+# Premarket / Midday LLM Insights (non-redundant with plan card)
+# -----------------------------
+def explain_insights(row: dict) -> str:
+    baseline = _baseline_insights_from_row(row)
+
+    prompt = f"""
+You are a cautious trading assistant. Rewrite BASELINE into insights.
+
+HARD RULES:
+- No financial advice/commands.
+- Use ONLY info from BASELINE (no new facts).
+- Output EXACTLY 4 lines with these labels in order:
+{chr(10).join(INSIGHT_LINES)}
+
+BASELINE:
+{baseline}
+""".strip()
+
+    return _run_with_retry(
+        prompt,
+        INSIGHT_LINES,
+        max_tokens=180,
+        row={**row, "baseline": baseline},
+        fallback_fn=_baseline_insights_from_row,
+    )
+
+
+def safe_explain_insights(row: dict) -> str:
+    try:
+        return explain_insights(row)
+    except Exception:
+        return _baseline_insights_from_row(row)
+
+
+# -----------------------------
+# Postmarket Coach
 # -----------------------------
 def postmarket_coach(run_date: str, prem_s: dict, mid_s: dict, all_s: dict) -> str:
     prompt = f"""
@@ -530,46 +611,23 @@ premarket: {prem_s}
 midday: {mid_s}
 combined: {all_s}
 """.strip()
-    return _run_with_retry(prompt, COACH_LINES, max_tokens=280)
 
-def _is_weak_block(text: str, labels: list[str]) -> bool:
-    """
-    Weak if:
-    - empty
-    - fallback block
-    - too many 'not provided'
-    - wrong labels/line count
-    """
-    t = _normalize_text(text)
-    if not t:
-        return True
+    return _run_with_retry(
+        prompt,
+        COACH_LINES,
+        max_tokens=280,
+        row={"run_date": run_date, "premarket": prem_s, "midday": mid_s, "combined": all_s},
+        fallback_fn=lambda _row: _baseline_coach_from_stats(run_date, prem_s, mid_s, all_s),
+    )
 
-    # Exact fallback string check
-    if t.strip() == _fallback_block(labels).strip():
-        return True
-
-    lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
-    if len(lines) != len(labels):
-        return True
-
-    if not all(lines[i].startswith(labels[i]) for i in range(len(labels))):
-        return True
-
-    np_count = sum("not provided" in ln.lower() for ln in lines)
-    return np_count >= len(labels) - 2
 
 def safe_postmarket_coach(run_date: str, prem_s: dict, mid_s: dict, all_s: dict) -> str:
     try:
         out = postmarket_coach(run_date, prem_s, mid_s, all_s)
-
-        # ✅ If LLM returns weak/empty/not-provided block, use deterministic coach
         if _is_weak_block(out, COACH_LINES):
             return _baseline_coach_from_stats(run_date, prem_s, mid_s, all_s)
-
         return out
-
     except Exception as e:
-        # ✅ Hard failure: deterministic fallback first
         try:
             return _baseline_coach_from_stats(run_date, prem_s, mid_s, all_s)
         except Exception:

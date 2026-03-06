@@ -1,6 +1,6 @@
 # news_fetcher.py
 from __future__ import annotations
-
+import re
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -62,6 +62,11 @@ _ALLOWED_NEWS_DOMAINS = {
     "investors.com", "morningstar.com", "fool.com", "thestreet.com",
     "nasdaq.com", "nytimes.com", "theguardian.com", "apnews.com", "bbc.com",
     "globenewswire.com", "prnewswire.com", "businesswire.com",
+
+    # Added trusted finance sources
+    "barrons.com", "investing.com", "zacks.com",
+    "thefly.com", "tipranks.com", "fortune.com",
+    "forbes.com", "axios.com",
 }
 
 # Extra soft-block patterns (keep small, let BLOCKED_NEWS_DOMAINS do the heavy work)
@@ -105,7 +110,15 @@ def _is_relevant(symbol: str, title: str, url: str) -> bool:
     # strong relevance: ticker appears in title or URL
     if sym:
         sym_l = sym.lower()
-        if sym_l in t or f"/{sym_l}" in u or f"={sym_l}" in u:
+
+        # exact ticker match in title (prevents MU matching "music", IN matching "in", etc.)
+        ticker_pattern = rf"\b{re.escape(sym_l)}\b"
+
+        if re.search(ticker_pattern, t):
+            return True
+
+        # ticker in URL patterns
+        if f"/{sym_l}" in u or f"={sym_l}" in u or f"/quote/{sym_l}" in u:
             return True
 
     # fallback: trusted domains (still better than random)

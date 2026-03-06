@@ -7,5 +7,5 @@ feedparser>=6.0.10
 python-dotenv>=1.0
 schedule>=1.2.0
 lxml>=4.9
-resend
+resend>=0.6,<1.0
 openai>=1.30,<2.0
