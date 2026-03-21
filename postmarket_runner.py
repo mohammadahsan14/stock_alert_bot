@@ -125,7 +125,10 @@ def send_email(subject: str, html_body: str, attachment_path: str | None = None)
 
 def send_postmarket_email_once(now: datetime, subject: str, html_body: str, attachment_path: str | None = None) -> bool:
     sent_flag = Path(run_dir(now, "postmarket")) / f"email_sent_{now.strftime('%Y-%m-%d')}.txt"
-    if sent_flag.exists():
+    force_email = os.getenv("FORCE_EMAIL", "0") == "1"
+
+
+    if sent_flag.exists() and not force_email:
         print("📩 Postmarket email already sent for this run_date — skipping resend.")
         return False
 
@@ -179,6 +182,23 @@ PERF_COLS = [
     "best_exit_from_target_pct",
     "best_exit_latency_minutes",
     "outcome",
+
+    # NEW: midday next-session evaluation columns
+    "next_session_end",
+    "next_close_price",
+    "next_actual_change_pct_close",
+    "next_target_hit",
+    "next_stop_hit",
+    "next_first_hit",
+    "next_first_hit_time",
+    "next_hit_latency_minutes",
+    "next_target_overshoot_pct",
+    "next_best_exit_price_after_target",
+    "next_best_exit_time_after_target",
+    "next_best_exit_from_entry_pct",
+    "next_best_exit_from_target_pct",
+    "next_best_exit_latency_minutes",
+    "next_outcome",
 ]
 ensure_csv_exists(PERF_LOG_CSV, PERF_COLS)
 
@@ -365,6 +385,344 @@ def _compute_outcome_from_hits(target_hit: bool, stop_hit: bool) -> str:
         return "🛑 Stop Hit"
     return "⏳ Not Hit"
 
+def _next_trading_day(day) -> datetime.date:
+    d = pd.to_datetime(day, errors="coerce")
+    if pd.isna(d):
+        d = pd.Timestamp(datetime.now(LOCAL_TZ).date())
+    cur = d.date()
+    while True:
+        cur = cur + timedelta(days=1)
+        if cur.weekday() < 5:  # Mon-Fri
+            return cur
+
+
+def _evaluate_window(
+    symbol: str,
+    entry: Optional[float],
+    target: Optional[float],
+    stop: Optional[float],
+    reco_dt: datetime,
+    window_end: datetime,
+    close_run_date: str,
+) -> dict:
+    """
+    Evaluate one row over a custom time window.
+    Used for:
+      - same-day evaluation
+      - next-session evaluation
+    """
+    if reco_dt.tzinfo is None:
+        reco_dt = reco_dt.replace(tzinfo=LOCAL_TZ)
+
+    close_price = _get_close_for_date(symbol, close_run_date)
+    actual_change_pct_close = pd.NA
+    if close_price is not None and entry is not None and entry > 0:
+        actual_change_pct_close = ((close_price - entry) / entry) * 100.0
+
+    intraday = _intraday_after_reco(symbol, reco_dt, window_end)
+
+    result = {
+        "day_high_after_reco": pd.NA,
+        "day_low_after_reco": pd.NA,
+        "close_price": close_price,
+        "actual_change_pct_close": actual_change_pct_close,
+        "target_hit": False,
+        "stop_hit": False,
+        "first_hit": "",
+        "first_hit_time": "",
+        "hit_latency_minutes": pd.NA,
+        "target_overshoot_pct": pd.NA,
+        "best_exit_price_after_target": pd.NA,
+        "best_exit_time_after_target": "",
+        "best_exit_from_entry_pct": pd.NA,
+        "best_exit_from_target_pct": pd.NA,
+        "best_exit_latency_minutes": pd.NA,
+        "outcome": "⏳ Not Hit",
+    }
+
+    if intraday is None or intraday.empty:
+        if close_price is None:
+            result["first_hit"] = "NO_DATA"
+            result["first_hit_time"] = "no_intraday_no_close"
+            result["outcome"] = "⛔ No Data (Market Closed / Holiday)"
+            return result
+
+        if not EVAL_FALLBACK_STRICT:
+            if close_price is not None and target is not None and target > 0 and close_price >= target:
+                result["target_hit"] = True
+                result["first_hit"] = "TARGET"
+                result["first_hit_time"] = "close_fallback"
+            elif close_price is not None and stop is not None and stop > 0 and close_price <= stop:
+                result["stop_hit"] = True
+                result["first_hit"] = "STOP"
+                result["first_hit_time"] = "close_fallback"
+
+        result["outcome"] = _compute_outcome_from_hits(result["target_hit"], result["stop_hit"])
+        return result
+
+    hi = pd.to_numeric(intraday.get("High"), errors="coerce").dropna() if "High" in intraday.columns else pd.Series(dtype=float)
+    lo = pd.to_numeric(intraday.get("Low"), errors="coerce").dropna() if "Low" in intraday.columns else pd.Series(dtype=float)
+
+    max_high = float(hi.max()) if not hi.empty else None
+    min_low = float(lo.min()) if not lo.empty else None
+
+    result["day_high_after_reco"] = max_high if max_high is not None else pd.NA
+    result["day_low_after_reco"] = min_low if min_low is not None else pd.NA
+
+    has_target = target is not None and target > 0
+    has_stop = stop is not None and stop > 0
+
+    if not has_target and not has_stop:
+        return result
+
+    first_hit_dt: Optional[datetime] = None
+
+    for ts, bar in intraday.iterrows():
+        bar_high = _safe_float(bar.get("High"))
+        bar_low = _safe_float(bar.get("Low"))
+
+        hit_target_now = has_target and (bar_high is not None) and (bar_high >= target)
+        hit_stop_now = has_stop and (bar_low is not None) and (bar_low <= stop)
+
+        if hit_target_now and hit_stop_now:
+            if str(CONSERVATIVE_SAME_BAR_POLICY).strip().lower() == "target_first":
+                result["target_hit"] = True
+                result["first_hit"] = "TARGET"
+            else:
+                result["stop_hit"] = True
+                result["first_hit"] = "STOP"
+            first_hit_dt = ts if isinstance(ts, datetime) else None
+            break
+
+        if hit_target_now:
+            result["target_hit"] = True
+            result["first_hit"] = "TARGET"
+            first_hit_dt = ts if isinstance(ts, datetime) else None
+            break
+
+        if hit_stop_now:
+            result["stop_hit"] = True
+            result["first_hit"] = "STOP"
+            first_hit_dt = ts if isinstance(ts, datetime) else None
+            break
+
+    if first_hit_dt is not None:
+        try:
+            first_hit_dt = first_hit_dt.astimezone(LOCAL_TZ)
+            result["first_hit_time"] = first_hit_dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            result["first_hit_time"] = str(first_hit_dt)
+
+        try:
+            latency = round((first_hit_dt - reco_dt).total_seconds() / 60.0, 2)
+            result["hit_latency_minutes"] = max(latency, 0.0)
+        except Exception:
+            result["hit_latency_minutes"] = pd.NA
+
+    if result["target_hit"] and has_target and max_high is not None and target and target > 0:
+        result["target_overshoot_pct"] = round(((max_high - target) / target) * 100.0, 3)
+
+    if result["target_hit"] and first_hit_dt is not None and "High" in intraday.columns:
+        after = intraday[intraday.index >= first_hit_dt].copy()
+        if not after.empty:
+            after_hi = pd.to_numeric(after["High"], errors="coerce").dropna()
+            if not after_hi.empty:
+                best_val = float(after_hi.max())
+                result["best_exit_price_after_target"] = best_val
+
+                try:
+                    best_time = after_hi.idxmax()
+                    if isinstance(best_time, datetime):
+                        best_time = best_time.astimezone(LOCAL_TZ)
+                        result["best_exit_time_after_target"] = best_time.strftime("%Y-%m-%d %H:%M:%S")
+                        result["best_exit_latency_minutes"] = max(
+                            round((best_time - reco_dt).total_seconds() / 60.0, 2),
+                            0.0,
+                        )
+                except Exception:
+                    pass
+
+                if entry is not None and entry > 0:
+                    result["best_exit_from_entry_pct"] = round(((best_val - entry) / entry) * 100.0, 3)
+
+                if target is not None and target > 0:
+                    result["best_exit_from_target_pct"] = round(((best_val - target) / target) * 100.0, 3)
+
+    result["outcome"] = _compute_outcome_from_hits(result["target_hit"], result["stop_hit"])
+    return result
+
+
+def evaluate_midday_next_session(df_in: pd.DataFrame, run_date: str) -> pd.DataFrame:
+    """
+    Midday next-session evaluation:
+    - reco starts at midday recommendation timestamp
+    - evaluation window ends next trading day's close
+    """
+    if df_in is None or df_in.empty:
+        return pd.DataFrame()
+
+    df = df_in.copy()
+    df = _ensure_cols(
+        df,
+        ["symbol", "current", "target_price", "stop_loss", "run_ts", "source_mode"],
+    )
+
+    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+    df["entry_price"] = pd.to_numeric(df["current"], errors="coerce")
+
+    session_start, session_end = _session_bounds(run_date)
+    next_day = _next_trading_day(run_date)
+    next_session_end = datetime.combine(next_day, MARKET_CLOSE_CT, tzinfo=LOCAL_TZ)
+    next_run_date = next_day.strftime("%Y-%m-%d")
+
+    next_rows = []
+
+    for _, r in df.iterrows():
+        sym = str(r.get("symbol", "")).upper().strip()
+        entry = _safe_float(r.get("entry_price"))
+        target = _safe_float(r.get("target_price"))
+        stop = _safe_float(r.get("stop_loss"))
+
+        reco_dt = _parse_ts_maybe(r.get("run_ts")) or session_start
+        if reco_dt < session_start:
+            reco_dt = session_start
+        if reco_dt.tzinfo is None:
+            reco_dt = reco_dt.replace(tzinfo=LOCAL_TZ)
+
+        res = _evaluate_window(
+            symbol=sym,
+            entry=entry,
+            target=target,
+            stop=stop,
+            reco_dt=reco_dt,
+            window_end=next_session_end,
+            close_run_date=next_run_date,
+        )
+
+        next_rows.append({
+            "symbol": sym,
+            "next_session_end": next_session_end.strftime("%Y-%m-%d %H:%M:%S"),
+            "next_close_price": res["close_price"],
+            "next_actual_change_pct_close": res["actual_change_pct_close"],
+            "next_target_hit": res["target_hit"],
+            "next_stop_hit": res["stop_hit"],
+            "next_first_hit": res["first_hit"],
+            "next_first_hit_time": res["first_hit_time"],
+            "next_hit_latency_minutes": res["hit_latency_minutes"],
+            "next_target_overshoot_pct": res["target_overshoot_pct"],
+            "next_best_exit_price_after_target": res["best_exit_price_after_target"],
+            "next_best_exit_time_after_target": res["best_exit_time_after_target"],
+            "next_best_exit_from_entry_pct": res["best_exit_from_entry_pct"],
+            "next_best_exit_from_target_pct": res["best_exit_from_target_pct"],
+            "next_best_exit_latency_minutes": res["best_exit_latency_minutes"],
+            "next_outcome": res["outcome"],
+        })
+
+    return pd.DataFrame(next_rows)
+
+def backfill_prior_midday_next_session(perf_log_csv: str, daily_log_csv: str, run_date: str) -> None:
+    """
+    On today's postmarket run, backfill yesterday's midday rows with completed next-session results.
+    Example:
+      - run_date = 2026-03-18
+      - backfill midday rows from 2026-03-17
+      - next-session window ends today (2026-03-18 close)
+    """
+    try:
+        if (not os.path.exists(perf_log_csv)) or os.path.getsize(perf_log_csv) == 0:
+            return
+        if (not os.path.exists(daily_log_csv)) or os.path.getsize(daily_log_csv) == 0:
+            return
+
+        perf = pd.read_csv(perf_log_csv)
+        daily = pd.read_csv(daily_log_csv)
+
+        if perf.empty or daily.empty:
+            return
+
+        today = pd.to_datetime(run_date, errors="coerce")
+        if pd.isna(today):
+            return
+
+        # previous trading day
+        prev_day = today.date()
+        while True:
+            prev_day = prev_day - timedelta(days=1)
+            if prev_day.weekday() < 5:
+                break
+        prev_run_date = prev_day.strftime("%Y-%m-%d")
+
+        # load yesterday midday source rows from DAILY_LOG
+        daily_mid = daily.copy()
+        daily_mid = daily_mid[daily_mid.get("run_date", "").astype(str) == prev_run_date]
+        if "mode" in daily_mid.columns:
+            daily_mid = daily_mid[daily_mid["mode"].astype(str).str.lower() == "midday"].copy()
+
+        if daily_mid.empty:
+            return
+
+        # latest per symbol
+        if "run_ts" in daily_mid.columns:
+            daily_mid["run_ts"] = daily_mid["run_ts"].apply(_parse_ts_maybe)
+            daily_mid = daily_mid.sort_values("run_ts").drop_duplicates(subset=["symbol"], keep="last")
+
+        daily_mid["source_mode"] = "midday"
+
+        # compute completed next-session using prev_run_date as source date
+        next_eval = evaluate_midday_next_session(daily_mid, prev_run_date)
+        if next_eval.empty:
+            return
+
+        perf = _ensure_cols(perf, PERF_COLS)
+
+        # match ONLY yesterday midday rows in performance_log
+        mask = (
+            perf["run_date"].astype(str).str[:10].eq(prev_run_date) &
+            perf["source_mode"].astype(str).str.lower().eq("midday")
+        )
+
+        if not mask.any():
+            return
+
+        next_eval["symbol"] = next_eval["symbol"].astype(str).str.upper().str.strip()
+        perf["symbol"] = perf["symbol"].astype(str).str.upper().str.strip()
+
+        next_map = next_eval.set_index("symbol").to_dict(orient="index")
+
+        next_cols = [
+            "next_session_end",
+            "next_close_price",
+            "next_actual_change_pct_close",
+            "next_target_hit",
+            "next_stop_hit",
+            "next_first_hit",
+            "next_first_hit_time",
+            "next_hit_latency_minutes",
+            "next_target_overshoot_pct",
+            "next_best_exit_price_after_target",
+            "next_best_exit_time_after_target",
+            "next_best_exit_from_entry_pct",
+            "next_best_exit_from_target_pct",
+            "next_best_exit_latency_minutes",
+            "next_outcome",
+        ]
+
+        for c in next_cols:
+            if c in perf.columns:
+                perf[c] = perf[c].astype("object")
+
+        for i in perf[mask].index:
+            sym = perf.at[i, "symbol"]
+            row = next_map.get(sym)
+            if not row:
+                continue
+            for c in next_cols:
+                perf.at[i, c] = row.get(c, pd.NA)
+
+        perf.to_csv(perf_log_csv, index=False)
+
+    except Exception as e:
+        print("⚠️ prior midday next-session backfill failed:", e)
 
 def llm_daily_narrative(run_date: str, prem_s: dict, mid_s: dict, all_s: dict) -> str:
     prompt = f"""
@@ -393,25 +751,29 @@ Return exactly 4 lines, each starting with the bullet label above. No extra line
         return f"LLM unavailable ({type(e).__name__})"
 
 
-def _summarize_eval(df: pd.DataFrame) -> Dict[str, float]:
-    if df is None or df.empty:
+def _summarize_eval(df: pd.DataFrame, outcome_col: str = "outcome") -> Dict[str, float]:
+    if df is None or df.empty or outcome_col not in df.columns:
         return {"evaluated": 0, "wins": 0, "losses": 0, "not_hit": 0, "win_rate": 0.0}
 
-    eval_df = df[df["outcome"].isin(["🏆 Target Hit", "🛑 Stop Hit", "⏳ Not Hit"])].copy()
+    valid = ["🏆 Target Hit", "🛑 Stop Hit", "⏳ Not Hit"]
+    eval_df = df[df[outcome_col].isin(valid)].copy()
+
     total = int(len(eval_df))
-    wins = int((eval_df["outcome"] == "🏆 Target Hit").sum()) if total else 0
-    losses = int((eval_df["outcome"] == "🛑 Stop Hit").sum()) if total else 0
-    not_hit = int((eval_df["outcome"] == "⏳ Not Hit").sum()) if total else 0
+    wins = int((eval_df[outcome_col] == "🏆 Target Hit").sum()) if total else 0
+    losses = int((eval_df[outcome_col] == "🛑 Stop Hit").sum()) if total else 0
+    not_hit = int((eval_df[outcome_col] == "⏳ Not Hit").sum()) if total else 0
     rate = (wins / total * 100.0) if total else 0.0
     return {"evaluated": total, "wins": wins, "losses": losses, "not_hit": not_hit, "win_rate": rate}
 
 
-def _summarize_eval_by_instrument(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+def _summarize_eval_by_instrument(df: pd.DataFrame, outcome_col: str = "outcome") -> Dict[str, Dict[str, float]]:
     out = {}
     if df is None or df.empty:
-        return {"stock": _summarize_eval(pd.DataFrame()), "options": _summarize_eval(pd.DataFrame())}
+        return {"stock": _summarize_eval(pd.DataFrame(), outcome_col), "options": _summarize_eval(pd.DataFrame(), outcome_col)}
+
     for k in ["stock", "options"]:
-        out[k] = _summarize_eval(df[df.get("instrument_type", "") == k].copy())
+        subset = df[df.get("instrument_type", "") == k].copy()
+        out[k] = _summarize_eval(subset, outcome_col=outcome_col)
     return out
 
 
@@ -1006,6 +1368,12 @@ def build_weekly_dashboard_html(perf_log_csv: str, now: datetime) -> str:
             if "stop_hit" in df.columns:
                 df.loc[df["outcome"] == "🛑 Stop Hit", "stop_hit"] = True
 
+        if "next_outcome" in df.columns:
+            if "next_target_hit" in df.columns:
+                df.loc[df["next_outcome"] == "🏆 Target Hit", "next_target_hit"] = True
+            if "next_stop_hit" in df.columns:
+                df.loc[df["next_outcome"] == "🛑 Stop Hit", "next_stop_hit"] = True
+
         d7 = df[df["run_date"] >= week_ago].copy()
         if d7.empty:
             return "<h2>📅 Weekly Dashboard</h2><p>No rows in last 7 days.</p>"
@@ -1013,28 +1381,48 @@ def build_weekly_dashboard_html(perf_log_csv: str, now: datetime) -> str:
         all_s = _summarize_eval(d7)
         prem_s = _summarize_eval(d7[d7["source_mode"] == "premarket"].copy())
         mid_s = _summarize_eval(d7[d7["source_mode"] == "midday"].copy())
+        mid_next_s = _summarize_eval(d7[d7["source_mode"] == "midday"].copy(), outcome_col="next_outcome")
 
         all_by = _summarize_eval_by_instrument(d7)
         prem_by = _summarize_eval_by_instrument(d7[d7["source_mode"] == "premarket"].copy())
         mid_by = _summarize_eval_by_instrument(d7[d7["source_mode"] == "midday"].copy())
+        mid_next_by = _summarize_eval_by_instrument(d7[d7["source_mode"] == "midday"].copy(), outcome_col="next_outcome")
 
-        return f"""
+        weekly_narrative = ""
+        weekly_coach = ""
+        LLM_ENABLED = os.getenv("LLM_ENABLED", "1") == "1"
+        if LLM_ENABLED:
+            weekly_narrative = safe_llm_weekly_narrative(now, prem_s, mid_s, mid_next_s, all_s)
+            weekly_coach = safe_llm_weekly_coach(now, prem_s, mid_s, mid_next_s, all_s)
+
+        html = f"""
         <h2>📅 Weekly Trading Dashboard ({now.strftime('%Y-%m-%d')})</h2>
 
-        <p><b>ALL (7d):</b> evaluated={all_s["evaluated"]}, wins={all_s["wins"]}, losses={all_s["losses"]}, not_hit={all_s["not_hit"]}, win_rate={all_s["win_rate"]:.2f}%</p>
-        <p><b>Premarket (7d):</b> evaluated={prem_s["evaluated"]}, win_rate={prem_s["win_rate"]:.2f}%<br>
-           <b>Midday (7d):</b> evaluated={mid_s["evaluated"]}, win_rate={mid_s["win_rate"]:.2f}%</p>
+        <p><b>ALL same-day (7d):</b> evaluated={all_s["evaluated"]}, wins={all_s["wins"]}, losses={all_s["losses"]}, not_hit={all_s["not_hit"]}, win_rate={all_s["win_rate"]:.2f}%</p>
+        <p><b>Premarket same-day (7d):</b> evaluated={prem_s["evaluated"]}, win_rate={prem_s["win_rate"]:.2f}%<br>
+           <b>Midday same-day (7d):</b> evaluated={mid_s["evaluated"]}, win_rate={mid_s["win_rate"]:.2f}%<br>
+           <b>Midday next-session (7d):</b> evaluated={mid_next_s["evaluated"]}, win_rate={mid_next_s["win_rate"]:.2f}%</p>
 
         <h3>📦 Instrument Buckets (7d)</h3>
-        <p><b>ALL - Stock:</b> eval={all_by["stock"]["evaluated"]}, win_rate={all_by["stock"]["win_rate"]:.2f}% |
+        <p><b>ALL same-day - Stock:</b> eval={all_by["stock"]["evaluated"]}, win_rate={all_by["stock"]["win_rate"]:.2f}% |
            <b>Options:</b> eval={all_by["options"]["evaluated"]}, win_rate={all_by["options"]["win_rate"]:.2f}%</p>
-        <p><b>Premarket - Stock:</b> eval={prem_by["stock"]["evaluated"]}, win_rate={prem_by["stock"]["win_rate"]:.2f}% |
+        <p><b>Premarket same-day - Stock:</b> eval={prem_by["stock"]["evaluated"]}, win_rate={prem_by["stock"]["win_rate"]:.2f}% |
            <b>Options:</b> eval={prem_by["options"]["evaluated"]}, win_rate={prem_by["options"]["win_rate"]:.2f}%</p>
-        <p><b>Midday - Stock:</b> eval={mid_by["stock"]["evaluated"]}, win_rate={mid_by["stock"]["win_rate"]:.2f}% |
+        <p><b>Midday same-day - Stock:</b> eval={mid_by["stock"]["evaluated"]}, win_rate={mid_by["stock"]["win_rate"]:.2f}% |
            <b>Options:</b> eval={mid_by["options"]["evaluated"]}, win_rate={mid_by["options"]["win_rate"]:.2f}%</p>
+        <p><b>Midday next-session - Stock:</b> eval={mid_next_by["stock"]["evaluated"]}, win_rate={mid_next_by["stock"]["win_rate"]:.2f}% |
+           <b>Options:</b> eval={mid_next_by["options"]["evaluated"]}, win_rate={mid_next_by["options"]["win_rate"]:.2f}%</p>
 
         <p>Win definition: target price hit at any time after recommendation (intraday high ≥ target).</p>
         """
+
+        if weekly_narrative:
+            html += f"<h3>🧠 Weekly LLM Narrative</h3><pre>{_html.escape(weekly_narrative)}</pre>"
+
+        if weekly_coach:
+            html += f"<h3>🧠 Weekly LLM Coach</h3><pre>{_html.escape(weekly_coach)}</pre>"
+
+        return html
     except Exception:
         return "<h2>📅 Weekly Dashboard</h2><p>Dashboard generation failed.</p>"
 
@@ -1118,16 +1506,26 @@ def normalize_perf_df(df: pd.DataFrame) -> pd.DataFrame:
     legacy_map = {"✅ Correct": "🏆 Target Hit", "❌ Incorrect": "🛑 Stop Hit"}
     df["outcome"] = df["outcome"].replace(legacy_map)
 
-    for b in ["target_hit", "stop_hit"]:
+    for b in ["target_hit", "stop_hit", "next_target_hit", "next_stop_hit"]:
         if b in df.columns:
             s = df[b].astype(str).str.strip().str.upper()
-            df[b] = s.map({"TRUE": True, "FALSE": False}).fillna(False).astype(bool)
+            df[b] = s.map({"TRUE": True, "FALSE": False})
+            df[b] = df[b].where(pd.notna(df[b]), False).astype(bool)
 
     if "outcome" in df.columns:
         if "target_hit" in df.columns:
             df.loc[df["outcome"] == "🏆 Target Hit", "target_hit"] = True
         if "stop_hit" in df.columns:
             df.loc[df["outcome"] == "🛑 Stop Hit", "stop_hit"] = True
+
+    if "next_outcome" in df.columns:
+        df["next_outcome"] = df["next_outcome"].replace(legacy_map)
+
+    if "next_outcome" in df.columns:
+        if "next_target_hit" in df.columns:
+            df.loc[df["next_outcome"] == "🏆 Target Hit", "next_target_hit"] = True
+        if "next_stop_hit" in df.columns:
+            df.loc[df["next_outcome"] == "🛑 Stop Hit", "next_stop_hit"] = True
 
     return df
 
@@ -1245,6 +1643,124 @@ def safe_llm_daily_narrative(run_date: str, prem_s: dict, mid_s: dict, all_s: di
     except Exception:
         return _baseline_narrative_from_stats(run_date, prem_s, mid_s, all_s)
 
+def llm_weekly_narrative(now: datetime, prem_s: dict, mid_s: dict, mid_next_s: dict, all_s: dict) -> str:
+    prompt = f"""
+You are a cautious trading performance analyst.
+
+Write a short WEEKLY narrative using ONLY these stats.
+No financial advice. No made-up numbers. Keep it concise.
+
+Stats:
+week_end: {now.strftime('%Y-%m-%d')}
+premarket_same_day: {prem_s}
+midday_same_day: {mid_s}
+midday_next_session: {mid_next_s}
+combined_same_day: {all_s}
+
+Output format (exact):
+- Weekly headline:
+- What worked:
+- What didn’t:
+- Next-week focus:
+
+Return exactly 4 lines, each starting with the bullet label above. No extra lines.
+"""
+    try:
+        return llm_text(prompt, max_output_tokens=260).strip()
+    except Exception as e:
+        return f"LLM unavailable ({type(e).__name__})"
+
+
+def safe_llm_weekly_narrative(now: datetime, prem_s: dict, mid_s: dict, mid_next_s: dict, all_s: dict) -> str:
+    total = int(all_s.get("evaluated", 0) or 0) + int(mid_next_s.get("evaluated", 0) or 0)
+    if total <= 0:
+        return "\n".join([
+            "- Weekly headline: No evaluated weekly rows found.",
+            "- What worked: not provided",
+            "- What didn’t: not provided",
+            "- Next-week focus: Verify performance_log is writing correctly.",
+        ])
+
+    try:
+        out = llm_weekly_narrative(now, prem_s, mid_s, mid_next_s, all_s)
+        if not str(out or "").strip():
+            raise ValueError("empty weekly narrative")
+
+        lines = [ln.strip() for ln in str(out).splitlines() if ln.strip()]
+        required = [
+            "- Weekly headline:",
+            "- What worked:",
+            "- What didn’t:",
+            "- Next-week focus:",
+        ]
+        if len(lines) < 4 or any(not lines[i].startswith(required[i]) for i in range(4)):
+            raise ValueError("bad weekly narrative structure")
+
+        return "\n".join(lines[:4]).strip()
+    except Exception:
+        return "\n".join([
+            f"- Weekly headline: Premarket same-day win_rate={prem_s.get('win_rate', 0.0):.2f}%, midday same-day win_rate={mid_s.get('win_rate', 0.0):.2f}%, midday next-session win_rate={mid_next_s.get('win_rate', 0.0):.2f}%.",
+            "- What worked: Premarket and next-session follow-through should be compared side by side.",
+            "- What didn’t: Midday same-day performance appears weaker than desired.",
+            "- Next-week focus: Keep monitoring midday next-session truth before changing generation logic.",
+        ])
+
+
+def llm_weekly_coach(now: datetime, prem_s: dict, mid_s: dict, mid_next_s: dict, all_s: dict) -> str:
+    prompt = f"""
+You are a cautious trading system coach.
+
+Use ONLY the stats below. No made-up facts. No trading advice.
+Give a short weekly coaching note for the system owner.
+
+Stats:
+week_end: {now.strftime('%Y-%m-%d')}
+premarket_same_day: {prem_s}
+midday_same_day: {mid_s}
+midday_next_session: {mid_next_s}
+combined_same_day: {all_s}
+
+Output format (exact):
+- Weekly coaching view:
+- Key evidence:
+- Risk note:
+- Next action:
+
+Return exactly 4 lines.
+"""
+    try:
+        return llm_text(prompt, max_output_tokens=260).strip()
+    except Exception as e:
+        return f"LLM unavailable ({type(e).__name__})"
+
+
+def safe_llm_weekly_coach(now: datetime, prem_s: dict, mid_s: dict, mid_next_s: dict, all_s: dict) -> str:
+    try:
+        out = llm_weekly_coach(now, prem_s, mid_s, mid_next_s, all_s)
+        if not str(out or "").strip():
+            raise ValueError("empty weekly coach")
+
+        lines = [ln.strip() for ln in str(out).splitlines() if ln.strip()]
+        required = [
+            "- Weekly coaching view:",
+            "- Key evidence:",
+            "- Risk note:",
+            "- Next action:",
+        ]
+        if len(lines) < 4 or any(not lines[i].startswith(required[i]) for i in range(4)):
+            raise ValueError("bad weekly coach structure")
+
+        return "\n".join(lines[:4]).strip()
+    except Exception:
+        return "\n".join([
+            "- Weekly coaching view: Treat midday as discovery mode until next-session results stabilize.",
+            "- Key evidence: Compare midday same-day and midday next-session win rates directly.",
+            "- Risk note: Small weekly samples can distort signal quality conclusions.",
+            "- Next action: Keep premarket unchanged and monitor midday next-session for another week.",
+        ])
+
+
+
 
 # -----------------------------
 # Postmarket runner
@@ -1274,6 +1790,11 @@ def run_postmarket(now: datetime | None = None) -> None:
     prem_eval = evaluate_rows(prem, run_date) if not prem.empty else pd.DataFrame()
     mid_eval = evaluate_rows(mid, run_date) if not mid.empty else pd.DataFrame()
 
+    mid_next_eval = evaluate_midday_next_session(mid, run_date) if not mid.empty else pd.DataFrame()
+    if not mid_eval.empty and not mid_next_eval.empty:
+        mid_eval = mid_eval.merge(mid_next_eval, on="symbol", how="left")
+        mid_eval = _ensure_cols(mid_eval, PERF_COLS)[PERF_COLS]
+
     all_eval = (
         pd.concat([prem_eval, mid_eval], ignore_index=True)
         if (not prem_eval.empty or not mid_eval.empty)
@@ -1289,6 +1810,8 @@ def run_postmarket(now: datetime | None = None) -> None:
             prem_eval.to_csv(Path(rf) / "debug_premarket_eval.csv", index=False)
         if mid_eval is not None and not mid_eval.empty:
             mid_eval.to_csv(Path(rf) / "debug_midday_eval.csv", index=False)
+
+    force_weekly_email = os.getenv("FORCE_WEEKLY_EMAIL", "0") == "1"
 
     if all_eval.empty:
         html = f"""
@@ -1307,6 +1830,28 @@ def run_postmarket(now: datetime | None = None) -> None:
         """
 
         send_postmarket_email_once(now, f"📊 Post-Market Summary ({run_date})", html)
+
+        if force_weekly_email or now.weekday() == 4:
+            dash = build_weekly_dashboard_html(PERF_LOG_CSV, now)
+            weekly_excel, rows_7d, rows_total = build_weekly_excel(PERF_LOG_CSV, now)
+
+            dash += f"""
+            <hr>
+            <p><b>Debug:</b><br>
+            perf_log_path: {PERF_LOG_CSV}<br>
+            perf_log_exists: {os.path.exists(PERF_LOG_CSV)}<br>
+            perf_log_size_bytes: {os.path.getsize(PERF_LOG_CSV) if os.path.exists(PERF_LOG_CSV) else 0}<br>
+            perf_rows_total: {rows_total}<br>
+            perf_rows_last_7d: {rows_7d}<br>
+            weekly_excel: {weekly_excel}
+            </p>
+            """
+
+            if psummary_text:
+                dash += f"<h3>📁 Current Portfolio</h3><pre>{_html.escape(psummary_text)}</pre>"
+
+            send_email(f"📅 Weekly Trading Dashboard ({run_date})", dash, attachment_path=weekly_excel)
+
         return
 
     prem_s = _summarize_eval(prem_eval)
@@ -1316,6 +1861,9 @@ def run_postmarket(now: datetime | None = None) -> None:
     prem_by = _summarize_eval_by_instrument(prem_eval)
     mid_by = _summarize_eval_by_instrument(mid_eval)
     all_by = _summarize_eval_by_instrument(all_eval)
+
+    mid_next_s = _summarize_eval(mid_eval, outcome_col="next_outcome")
+    mid_next_by = _summarize_eval_by_instrument(mid_eval, outcome_col="next_outcome")
 
     suggestions_obj = compute_strategy_suggestions_from_stats(run_date, prem_s, mid_s, all_s)
     save_strategy_suggestions_json(suggestions_obj, Path(rf))
@@ -1339,15 +1887,29 @@ def run_postmarket(now: datetime | None = None) -> None:
 
         <h3>⚡ Midday</h3>
         <p>
+          <b>Same-day:</b><br>
           evaluated: {mid_s["evaluated"]}<br>
           wins (target hit): {mid_s["wins"]}<br>
           losses (stop hit): {mid_s["losses"]}<br>
           not hit: {mid_s["not_hit"]}<br>
           win rate: {mid_s["win_rate"]:.2f}%
         </p>
-        <p><b>Midday buckets:</b>
+        <p><b>Midday same-day buckets:</b>
           Stock win_rate={mid_by["stock"]["win_rate"]:.2f}% (n={mid_by["stock"]["evaluated"]}) |
           Options win_rate={mid_by["options"]["win_rate"]:.2f}% (n={mid_by["options"]["evaluated"]})
+        </p>
+        
+        <p>
+          <b>Next-session:</b><br>
+          evaluated: {mid_next_s["evaluated"]}<br>
+          wins (target hit): {mid_next_s["wins"]}<br>
+          losses (stop hit): {mid_next_s["losses"]}<br>
+          not hit: {mid_next_s["not_hit"]}<br>
+          win rate: {mid_next_s["win_rate"]:.2f}%
+        </p>
+        <p><b>Midday next-session buckets:</b>
+          Stock win_rate={mid_next_by["stock"]["win_rate"]:.2f}% (n={mid_next_by["stock"]["evaluated"]}) |
+          Options win_rate={mid_next_by["options"]["win_rate"]:.2f}% (n={mid_next_by["options"]["evaluated"]})
         </p>
 
         <h3>📌 Combined</h3>
@@ -1392,19 +1954,49 @@ def run_postmarket(now: datetime | None = None) -> None:
     )
 
     summary_df = pd.DataFrame([
-        {"bucket": "premarket", "evaluated": prem_s["evaluated"], "wins": prem_s["wins"], "losses": prem_s["losses"], "not_hit": prem_s["not_hit"], "win_rate_pct": round(prem_s["win_rate"], 2)},
-        {"bucket": "midday", "evaluated": mid_s["evaluated"], "wins": mid_s["wins"], "losses": mid_s["losses"], "not_hit": mid_s["not_hit"], "win_rate_pct": round(mid_s["win_rate"], 2)},
-        {"bucket": "combined", "evaluated": all_s["evaluated"], "wins": all_s["wins"], "losses": all_s["losses"], "not_hit": all_s["not_hit"], "win_rate_pct": round(all_s["win_rate"], 2)},
-        {"bucket": "combined_stock", "evaluated": all_by["stock"]["evaluated"], "wins": all_by["stock"]["wins"], "losses": all_by["stock"]["losses"], "not_hit": all_by["stock"]["not_hit"], "win_rate_pct": round(all_by["stock"]["win_rate"], 2)},
-        {"bucket": "combined_options", "evaluated": all_by["options"]["evaluated"], "wins": all_by["options"]["wins"], "losses": all_by["options"]["losses"], "not_hit": all_by["options"]["not_hit"], "win_rate_pct": round(all_by["options"]["win_rate"], 2)},
+        {"bucket": "premarket_same_day", "evaluated": prem_s["evaluated"], "wins": prem_s["wins"],
+         "losses": prem_s["losses"], "not_hit": prem_s["not_hit"], "win_rate_pct": round(prem_s["win_rate"], 2)},
+        {"bucket": "midday_same_day", "evaluated": mid_s["evaluated"], "wins": mid_s["wins"], "losses": mid_s["losses"],
+         "not_hit": mid_s["not_hit"], "win_rate_pct": round(mid_s["win_rate"], 2)},
+        {"bucket": "midday_next_session", "evaluated": mid_next_s["evaluated"], "wins": mid_next_s["wins"],
+         "losses": mid_next_s["losses"], "not_hit": mid_next_s["not_hit"],
+         "win_rate_pct": round(mid_next_s["win_rate"], 2)},
+        {"bucket": "combined_same_day", "evaluated": all_s["evaluated"], "wins": all_s["wins"],
+         "losses": all_s["losses"], "not_hit": all_s["not_hit"], "win_rate_pct": round(all_s["win_rate"], 2)},
+        {"bucket": "combined_stock_same_day", "evaluated": all_by["stock"]["evaluated"],
+         "wins": all_by["stock"]["wins"], "losses": all_by["stock"]["losses"], "not_hit": all_by["stock"]["not_hit"],
+         "win_rate_pct": round(all_by["stock"]["win_rate"], 2)},
+        {"bucket": "combined_options_same_day", "evaluated": all_by["options"]["evaluated"],
+         "wins": all_by["options"]["wins"], "losses": all_by["options"]["losses"],
+         "not_hit": all_by["options"]["not_hit"], "win_rate_pct": round(all_by["options"]["win_rate"], 2)},
     ])
 
     with pd.ExcelWriter(post_excel, engine="openpyxl") as writer:
         _excel_safe_df(summary_df).to_excel(writer, sheet_name="SUMMARY", index=False)
+
         if not prem_eval.empty:
             _excel_safe_df(prem_eval).to_excel(writer, sheet_name="PREMARKET_EVAL", index=False)
+
         if not mid_eval.empty:
+            # Same-day midday evaluation
             _excel_safe_df(mid_eval).to_excel(writer, sheet_name="MIDDAY_EVAL", index=False)
+
+            # Next-session midday view
+            mid_next_view = mid_eval[[
+                "run_date", "symbol", "decision", "score", "confidence",
+                "entry_price", "target_price", "stop_loss",
+                "reco_ts", "next_session_end",
+                "next_close_price", "next_actual_change_pct_close",
+                "next_target_hit", "next_stop_hit",
+                "next_first_hit", "next_first_hit_time",
+                "next_hit_latency_minutes", "next_target_overshoot_pct",
+                "next_best_exit_price_after_target", "next_best_exit_time_after_target",
+                "next_best_exit_from_entry_pct", "next_best_exit_from_target_pct",
+                "next_best_exit_latency_minutes", "next_outcome",
+            ]].copy()
+
+            _excel_safe_df(mid_next_view).to_excel(writer, sheet_name="MIDDAY_NEXT_SESSION", index=False)
+
         _excel_safe_df(all_eval).to_excel(writer, sheet_name="ALL_EVAL", index=False)
 
     wb = load_workbook(post_excel)
@@ -1421,8 +2013,12 @@ def run_postmarket(now: datetime | None = None) -> None:
 
     append_perf_log(all_eval, now=now)
 
+    # Backfill prior day's midday next-session now that today's close is known
+    backfill_prior_midday_next_session(PERF_LOG_CSV, DAILY_LOG_CSV, run_date)
+
     # Friday = weekly dashboard
-    if now.weekday() == 4:
+    force_weekly_email = os.getenv("FORCE_WEEKLY_EMAIL", "0") == "1"
+    if force_weekly_email or now.weekday() == 4:
         dash = build_weekly_dashboard_html(PERF_LOG_CSV, now)
         weekly_excel, rows_7d, rows_total = build_weekly_excel(PERF_LOG_CSV, now)
 
