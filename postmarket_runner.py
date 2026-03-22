@@ -1374,7 +1374,10 @@ def build_weekly_dashboard_html(perf_log_csv: str, now: datetime) -> str:
             if "next_stop_hit" in df.columns:
                 df.loc[df["next_outcome"] == "🛑 Stop Hit", "next_stop_hit"] = True
 
-        d7 = df[df["run_date"] >= week_ago].copy()
+        df["run_date"] = pd.to_datetime(df["run_date"], errors="coerce")
+
+        d7 = df[df["run_date"].notna() & (df["run_date"] >= week_ago)].copy()
+
         if d7.empty:
             return "<h2>📅 Weekly Dashboard</h2><p>No rows in last 7 days.</p>"
 
@@ -1549,8 +1552,9 @@ def build_weekly_excel(perf_log_csv: str, now: datetime) -> Tuple[str, int, int]
     wdf = normalize_perf_df(wdf)
 
     if "run_date" in wdf.columns:
+        wdf["run_date"] = pd.to_datetime(wdf["run_date"], errors="coerce")
         cutoff = (now - timedelta(days=7)).date()
-        wdf7 = wdf[wdf["run_date"].dt.date >= cutoff].copy()
+        wdf7 = wdf[wdf["run_date"].notna() & (wdf["run_date"].dt.date >= cutoff)].copy()
     else:
         wdf7 = pd.DataFrame(columns=PERF_COLS)
 
