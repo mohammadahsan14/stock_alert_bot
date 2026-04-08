@@ -39,6 +39,8 @@ from top_movers import fetch_sp500_tickers, calculate_top_movers
 from scoring_engine import get_predictive_score_with_reasons
 from news_fetcher import fetch_news_links
 from forecast_engine import forecast_price_levels  # pred/target/stop
+from ml_strategy import predict_win_prob
+from price_action import compute_price_action_summary
 
 LOCAL_TZ = ZoneInfo("America/Chicago")
 
@@ -487,6 +489,16 @@ def _build_final_view(pass_df: pd.DataFrame, all_df: pd.DataFrame) -> pd.DataFra
         "score", "score_label", "confidence", "decision",
         "news_flag", "main_news_title", "main_news_link",
         "reasons", "llm_insights",
+        "candle_bias",
+        "body_pct",
+        "upper_wick_pct",
+        "lower_wick_pct",
+        "range_low",
+        "range_high",
+        "range_position_pct",
+        "range_zone",
+        "near_support",
+        "near_resistance",
     ]
 
     def _ensure(df: pd.DataFrame) -> pd.DataFrame:
@@ -933,7 +945,18 @@ ensure_csv_exists(DAILY_LOG_CSV, [
     "plan_card",
     "key_insight",
     "win_prob",
+    "ml_win_prob_pct",
     "expected_rr",
+    "candle_bias",
+    "body_pct",
+    "upper_wick_pct",
+    "lower_wick_pct",
+    "range_low",
+    "range_high",
+    "range_position_pct",
+    "range_zone",
+    "near_support",
+    "near_resistance",
 ])
 
 def _clean_text_cell(x) -> str:
@@ -961,10 +984,20 @@ def append_daily_log(final_view_df: pd.DataFrame, now: datetime, mode: str) -> N
         "current", "predicted_price", "target_price", "stop_loss",
         "forecast_trend", "forecast_atr", "forecast_reason",
         "trade_plan", "earnings_risk",
-        "decision", "win_prob", "expected_rr","score", "score_label", "confidence",
+        "decision", "win_prob", "ml_win_prob_pct", "expected_rr", "score", "score_label", "confidence",
         "reasons", "llm_insights", "news_flag", "main_news_title", "main_news_link",
         "stance", "stance_reason", "vote_score",
-        "plan_card","key_insight",
+        "plan_card", "key_insight",
+        "candle_bias",
+        "body_pct",
+        "upper_wick_pct",
+        "lower_wick_pct",
+        "range_low",
+        "range_high",
+        "range_position_pct",
+        "range_zone",
+        "near_support",
+        "near_resistance",
     ]
 
     out = final_view_df.copy()
@@ -977,7 +1010,12 @@ def append_daily_log(final_view_df: pd.DataFrame, now: datetime, mode: str) -> N
             out[c] = pd.NA
     out = out[cols]
 
-    for c in ["current", "predicted_price", "target_price", "stop_loss", "forecast_atr"]:
+    for c in [
+        "current", "predicted_price", "target_price", "stop_loss", "forecast_atr",
+        "win_prob", "ml_win_prob_pct", "expected_rr",
+        "body_pct", "upper_wick_pct", "lower_wick_pct",
+        "range_low", "range_high", "range_position_pct",
+    ]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
     existing = (
@@ -1121,10 +1159,34 @@ def run_midday(now: datetime | None = None) -> None:
     vol_ratios = []
     vol_cache: dict[str, Optional[float]] = {}
 
+    candle_biases = []
+    body_pcts = []
+    upper_wick_pcts = []
+    lower_wick_pcts = []
+    range_lows = []
+    range_highs = []
+    range_pos_pcts = []
+    range_zones = []
+    near_supports = []
+    near_resistances = []
+
     for _, row in thr_df.iterrows():
         sym = str(row.get("symbol", "")).upper().strip()
         current = float(row.get("current", 0.0) or 0.0)
         pct_change = float(row.get("pct_change", 0.0) or 0.0)
+
+        pa = compute_price_action_summary(sym, current)
+
+        candle_biases.append(pa.get("candle_bias"))
+        body_pcts.append(pa.get("body_pct"))
+        upper_wick_pcts.append(pa.get("upper_wick_pct"))
+        lower_wick_pcts.append(pa.get("lower_wick_pct"))
+        range_lows.append(pa.get("range_low"))
+        range_highs.append(pa.get("range_high"))
+        range_pos_pcts.append(pa.get("range_position_pct"))
+        range_zones.append(pa.get("range_zone"))
+        near_supports.append(pa.get("near_support"))
+        near_resistances.append(pa.get("near_resistance"))
 
         # --- Volume confirmation (optional) ---
         vol_ratio = None
@@ -1218,6 +1280,16 @@ def run_midday(now: datetime | None = None) -> None:
     all_df["forecast_trend"] = ftrends
     all_df["forecast_atr"] = fatrs
     all_df["forecast_reason"] = freasons
+    all_df["candle_bias"] = candle_biases
+    all_df["body_pct"] = pd.to_numeric(pd.Series(body_pcts, index=all_df.index), errors="coerce")
+    all_df["upper_wick_pct"] = pd.to_numeric(pd.Series(upper_wick_pcts, index=all_df.index), errors="coerce")
+    all_df["lower_wick_pct"] = pd.to_numeric(pd.Series(lower_wick_pcts, index=all_df.index), errors="coerce")
+    all_df["range_low"] = pd.to_numeric(pd.Series(range_lows, index=all_df.index), errors="coerce")
+    all_df["range_high"] = pd.to_numeric(pd.Series(range_highs, index=all_df.index), errors="coerce")
+    all_df["range_position_pct"] = pd.to_numeric(pd.Series(range_pos_pcts, index=all_df.index), errors="coerce")
+    all_df["range_zone"] = range_zones
+    all_df["near_support"] = near_supports
+    all_df["near_resistance"] = near_resistances
 
     pass_df = all_df[all_df["confidence"] >= CONF_GATE].copy()
     # -----------------------------
@@ -1320,6 +1392,24 @@ def run_midday(now: datetime | None = None) -> None:
             market_regime=str(market_regime or "unknown"),
         ),
         axis=1,
+    )
+
+    final_view_df["ml_win_prob"] = final_view_df.apply(
+        lambda r: predict_win_prob({
+            "score": r.get("score"),
+            "confidence": r.get("confidence"),
+            "current": r.get("current"),
+            "target_price": r.get("target_price"),
+            "stop_loss": r.get("stop_loss"),
+            "decision": r.get("decision"),
+            "source_mode": "midday",
+            "instrument_type": "stock",
+        }),
+        axis=1,
+    )
+
+    final_view_df["ml_win_prob_pct"] = final_view_df["ml_win_prob"].apply(
+        lambda x: round(float(x) * 100, 2) if x is not None and pd.notna(x) else pd.NA
     )
 
     # Optional: LLM for FINAL_VIEW only (kept but not required)

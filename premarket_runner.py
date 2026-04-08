@@ -53,6 +53,7 @@ from scoring_engine import get_predictive_score_with_reasons
 from forecast_engine import forecast_price_levels
 from news_fetcher import fetch_news_links
 from price_category import get_price_category
+from price_action import compute_price_action_summary
 
 from performance_tracker import (
     PortfolioConfig,
@@ -728,6 +729,16 @@ ensure_csv_exists(DAILY_LOG_CSV, [
     "expected_rr",
     "win_prob",
     "rel_strength",
+    "candle_bias",
+    "body_pct",
+    "upper_wick_pct",
+    "lower_wick_pct",
+    "range_low",
+    "range_high",
+    "range_position_pct",
+    "range_zone",
+    "near_support",
+    "near_resistance",
 ])
 
 
@@ -800,6 +811,16 @@ def append_daily_log(df_rows: pd.DataFrame, now: datetime, run_date: str, mode: 
         "llm_insights",
         "key_insight",
         "expected_rr", "win_prob", "rel_strength",
+        "candle_bias",
+        "body_pct",
+        "upper_wick_pct",
+        "lower_wick_pct",
+        "range_low",
+        "range_high",
+        "range_position_pct",
+        "range_zone",
+        "near_support",
+        "near_resistance",
     ]
 
     out = df_rows.copy()
@@ -812,7 +833,12 @@ def append_daily_log(df_rows: pd.DataFrame, now: datetime, run_date: str, mode: 
             out[c] = pd.NA
     out = out[cols]
 
-    for c in ["current", "predicted_price", "target_price", "stop_loss", "forecast_atr", "expected_rr", "win_prob", "rel_strength"]:
+    for c in [
+        "current", "predicted_price", "target_price", "stop_loss",
+        "forecast_atr", "expected_rr", "win_prob", "rel_strength",
+        "body_pct", "upper_wick_pct", "lower_wick_pct",
+        "range_low", "range_high", "range_position_pct",
+    ]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
     existing = (
@@ -1026,10 +1052,36 @@ def run_premarket(now: datetime | None = None) -> None:
     spy_pct = float(snapshot.get("spy_gap_pct") or 0.0)
 
     rows: List[Dict[str, Any]] = []
+
+    candle_biases = []
+    body_pcts = []
+    upper_wick_pcts = []
+    lower_wick_pcts = []
+    range_lows = []
+    range_highs = []
+    range_pos_pcts = []
+    range_zones = []
+    near_supports = []
+    near_resistances = []
+
     for _, r in df_raw.iterrows():
+
         sym = str(r.get("symbol", "")).upper().strip()
         current = float(r.get("current", 0.0) or 0.0)
         pct_change = float(r.get("pct_change", 0.0) or 0.0)
+
+        pa = compute_price_action_summary(sym, current)
+
+        candle_biases.append(pa.get("candle_bias"))
+        body_pcts.append(pa.get("body_pct"))
+        upper_wick_pcts.append(pa.get("upper_wick_pct"))
+        lower_wick_pcts.append(pa.get("lower_wick_pct"))
+        range_lows.append(pa.get("range_low"))
+        range_highs.append(pa.get("range_high"))
+        range_pos_pcts.append(pa.get("range_position_pct"))
+        range_zones.append(pa.get("range_zone"))
+        near_supports.append(pa.get("near_support"))
+        near_resistances.append(pa.get("near_resistance"))
 
         # ✅ NEW: rel strength vs SPY
         rel_strength = pct_change - spy_pct
@@ -1098,6 +1150,16 @@ def run_premarket(now: datetime | None = None) -> None:
             "news_flag": flag,
             "main_news_title": title,
             "main_news_link": link,
+            "candle_bias": pa.get("candle_bias"),
+            "body_pct": pa.get("body_pct"),
+            "upper_wick_pct": pa.get("upper_wick_pct"),
+            "lower_wick_pct": pa.get("lower_wick_pct"),
+            "range_low": pa.get("range_low"),
+            "range_high": pa.get("range_high"),
+            "range_position_pct": pa.get("range_position_pct"),
+            "range_zone": pa.get("range_zone"),
+            "near_support": pa.get("near_support"),
+            "near_resistance": pa.get("near_resistance"),
         })
 
     out_df = pd.DataFrame(rows)
