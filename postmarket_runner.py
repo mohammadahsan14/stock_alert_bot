@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, Dict
 
 import pandas as pd
-from pandas.api.types import is_datetime64tz_dtype
+from pandas import DatetimeTZDtype
 import yfinance as yf
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
@@ -199,6 +199,8 @@ PERF_COLS = [
     "next_best_exit_from_target_pct",
     "next_best_exit_latency_minutes",
     "next_outcome",
+    "combined_outcome",
+    "recovered_after_stop",
 ]
 ensure_csv_exists(PERF_LOG_CSV, PERF_COLS)
 
@@ -382,6 +384,26 @@ def _compute_outcome_from_hits(target_hit: bool, stop_hit: bool) -> str:
     if target_hit:
         return "🏆 Target Hit"
     if stop_hit:
+        return "🛑 Stop Hit"
+    return "⏳ Not Hit"
+
+def _compute_combined_midday_outcome(
+    same_day_target_hit: bool,
+    same_day_stop_hit: bool,
+    next_target_hit: bool,
+) -> str:
+    """
+    Midday combined interpretation:
+    - same-day target = true win
+    - same-day stop + next-session target = late win
+    - same-day stop only = loss
+    - otherwise not hit
+    """
+    if same_day_target_hit:
+        return "🏆 Target Hit"
+    if same_day_stop_hit and next_target_hit:
+        return "🟡 Late Win"
+    if same_day_stop_hit:
         return "🛑 Stop Hit"
     return "⏳ Not Hit"
 
@@ -753,17 +775,36 @@ Return exactly 4 lines, each starting with the bullet label above. No extra line
 
 def _summarize_eval(df: pd.DataFrame, outcome_col: str = "outcome") -> Dict[str, float]:
     if df is None or df.empty or outcome_col not in df.columns:
-        return {"evaluated": 0, "wins": 0, "losses": 0, "not_hit": 0, "win_rate": 0.0}
+        return {
+            "evaluated": 0,
+            "wins": 0,
+            "late_wins": 0,
+            "losses": 0,
+            "not_hit": 0,
+            "win_rate": 0.0,
+        }
 
-    valid = ["🏆 Target Hit", "🛑 Stop Hit", "⏳ Not Hit"]
+    valid = ["🏆 Target Hit", "🟡 Late Win", "🛑 Stop Hit", "⏳ Not Hit"]
     eval_df = df[df[outcome_col].isin(valid)].copy()
 
     total = int(len(eval_df))
     wins = int((eval_df[outcome_col] == "🏆 Target Hit").sum()) if total else 0
+    late_wins = int((eval_df[outcome_col] == "🟡 Late Win").sum()) if total else 0
     losses = int((eval_df[outcome_col] == "🛑 Stop Hit").sum()) if total else 0
     not_hit = int((eval_df[outcome_col] == "⏳ Not Hit").sum()) if total else 0
-    rate = (wins / total * 100.0) if total else 0.0
-    return {"evaluated": total, "wins": wins, "losses": losses, "not_hit": not_hit, "win_rate": rate}
+
+    # count late wins as wins for high-level effectiveness
+    effective_wins = wins + late_wins
+    rate = (effective_wins / total * 100.0) if total else 0.0
+
+    return {
+        "evaluated": total,
+        "wins": wins,
+        "late_wins": late_wins,
+        "losses": losses,
+        "not_hit": not_hit,
+        "win_rate": rate,
+    }
 
 
 def _summarize_eval_by_instrument(df: pd.DataFrame, outcome_col: str = "outcome") -> Dict[str, Dict[str, float]]:
@@ -1437,7 +1478,7 @@ def _excel_safe_df(df: pd.DataFrame, local_tz: str = "America/Chicago") -> pd.Da
     out = df.copy()
 
     for col in out.columns:
-        if is_datetime64tz_dtype(out[col]):
+        if isinstance(out[col].dtype, DatetimeTZDtype):
             out[col] = out[col].dt.tz_convert(local_tz).dt.tz_localize(None)
 
     def _strip_tz(v):
@@ -1522,13 +1563,22 @@ def normalize_perf_df(df: pd.DataFrame) -> pd.DataFrame:
             df.loc[df["outcome"] == "🛑 Stop Hit", "stop_hit"] = True
 
     if "next_outcome" in df.columns:
-        df["next_outcome"] = df["next_outcome"].replace(legacy_map)
-
-    if "next_outcome" in df.columns:
         if "next_target_hit" in df.columns:
             df.loc[df["next_outcome"] == "🏆 Target Hit", "next_target_hit"] = True
         if "next_stop_hit" in df.columns:
             df.loc[df["next_outcome"] == "🛑 Stop Hit", "next_stop_hit"] = True
+
+    if "combined_outcome" in df.columns:
+        df["combined_outcome"] = df["combined_outcome"].replace({"": pd.NA}).fillna(
+            df.get("outcome", pd.Series(dtype="object"))
+        )
+
+    if "recovered_after_stop" in df.columns:
+        s = df["recovered_after_stop"].astype(str).str.strip().str.upper()
+        df["recovered_after_stop"] = s.map({"TRUE": True, "FALSE": False})
+        df["recovered_after_stop"] = df["recovered_after_stop"].where(
+            pd.notna(df["recovered_after_stop"]), False
+        ).astype(bool)
 
     return df
 
@@ -1795,8 +1845,31 @@ def run_postmarket(now: datetime | None = None) -> None:
     mid_eval = evaluate_rows(mid, run_date) if not mid.empty else pd.DataFrame()
 
     mid_next_eval = evaluate_midday_next_session(mid, run_date) if not mid.empty else pd.DataFrame()
+
     if not mid_eval.empty and not mid_next_eval.empty:
         mid_eval = mid_eval.merge(mid_next_eval, on="symbol", how="left")
+
+        mid_eval["combined_outcome"] = mid_eval.apply(
+            lambda r: _compute_combined_midday_outcome(
+                bool(r.get("target_hit", False)),
+                bool(r.get("stop_hit", False)),
+                bool(r.get("next_target_hit", False)),
+            ),
+            axis=1,
+        )
+
+        mid_eval["recovered_after_stop"] = mid_eval.apply(
+            lambda r: bool(r.get("stop_hit", False)) and bool(r.get("next_target_hit", False)),
+            axis=1,
+        )
+
+        mid_eval = _ensure_cols(mid_eval, PERF_COLS)[PERF_COLS]
+
+
+    elif not mid_eval.empty:
+
+        mid_eval["combined_outcome"] = mid_eval["outcome"]
+        mid_eval["recovered_after_stop"] = False
         mid_eval = _ensure_cols(mid_eval, PERF_COLS)[PERF_COLS]
 
     all_eval = (
@@ -1868,6 +1941,7 @@ def run_postmarket(now: datetime | None = None) -> None:
 
     mid_next_s = _summarize_eval(mid_eval, outcome_col="next_outcome")
     mid_next_by = _summarize_eval_by_instrument(mid_eval, outcome_col="next_outcome")
+    mid_combined_s = _summarize_eval(mid_eval, outcome_col="combined_outcome")
 
     suggestions_obj = compute_strategy_suggestions_from_stats(run_date, prem_s, mid_s, all_s)
     save_strategy_suggestions_json(suggestions_obj, Path(rf))
@@ -1889,11 +1963,12 @@ def run_postmarket(now: datetime | None = None) -> None:
           Options win_rate={prem_by["options"]["win_rate"]:.2f}% (n={prem_by["options"]["evaluated"]})
         </p>
 
-        <h3>⚡ Midday</h3>
+         <h3>⚡ Midday</h3>
         <p>
           <b>Same-day:</b><br>
           evaluated: {mid_s["evaluated"]}<br>
           wins (target hit): {mid_s["wins"]}<br>
+          late wins: {mid_s.get("late_wins", 0)}<br>
           losses (stop hit): {mid_s["losses"]}<br>
           not hit: {mid_s["not_hit"]}<br>
           win rate: {mid_s["win_rate"]:.2f}%
@@ -1902,11 +1977,12 @@ def run_postmarket(now: datetime | None = None) -> None:
           Stock win_rate={mid_by["stock"]["win_rate"]:.2f}% (n={mid_by["stock"]["evaluated"]}) |
           Options win_rate={mid_by["options"]["win_rate"]:.2f}% (n={mid_by["options"]["evaluated"]})
         </p>
-        
+
         <p>
           <b>Next-session:</b><br>
           evaluated: {mid_next_s["evaluated"]}<br>
           wins (target hit): {mid_next_s["wins"]}<br>
+          late wins: {mid_next_s.get("late_wins", 0)}<br>
           losses (stop hit): {mid_next_s["losses"]}<br>
           not hit: {mid_next_s["not_hit"]}<br>
           win rate: {mid_next_s["win_rate"]:.2f}%
@@ -1916,17 +1992,14 @@ def run_postmarket(now: datetime | None = None) -> None:
           Options win_rate={mid_next_by["options"]["win_rate"]:.2f}% (n={mid_next_by["options"]["evaluated"]})
         </p>
 
-        <h3>📌 Combined</h3>
         <p>
-          evaluated: {all_s["evaluated"]}<br>
-          wins (target hit): {all_s["wins"]}<br>
-          losses (stop hit): {all_s["losses"]}<br>
-          not hit: {all_s["not_hit"]}<br>
-          win rate: {all_s["win_rate"]:.2f}%
-        </p>
-        <p><b>Combined buckets:</b>
-          Stock win_rate={all_by["stock"]["win_rate"]:.2f}% (n={all_by["stock"]["evaluated"]}) |
-          Options win_rate={all_by["options"]["win_rate"]:.2f}% (n={all_by["options"]["evaluated"]})
+          <b>Combined interpretation:</b><br>
+          evaluated: {mid_combined_s["evaluated"]}<br>
+          wins (same-day target): {mid_combined_s["wins"]}<br>
+          late wins (stop first, target later): {mid_combined_s.get("late_wins", 0)}<br>
+          losses: {mid_combined_s["losses"]}<br>
+          not hit: {mid_combined_s["not_hit"]}<br>
+          effective win rate: {mid_combined_s["win_rate"]:.2f}%
         </p>
     """
 
@@ -1973,6 +2046,9 @@ def run_postmarket(now: datetime | None = None) -> None:
         {"bucket": "combined_options_same_day", "evaluated": all_by["options"]["evaluated"],
          "wins": all_by["options"]["wins"], "losses": all_by["options"]["losses"],
          "not_hit": all_by["options"]["not_hit"], "win_rate_pct": round(all_by["options"]["win_rate"], 2)},
+        {"bucket": "midday_combined", "evaluated": mid_combined_s["evaluated"], "wins": mid_combined_s["wins"],
+         "losses": mid_combined_s["losses"], "not_hit": mid_combined_s["not_hit"],
+         "win_rate_pct": round(mid_combined_s["win_rate"], 2)},
     ])
 
     with pd.ExcelWriter(post_excel, engine="openpyxl") as writer:
@@ -1997,6 +2073,7 @@ def run_postmarket(now: datetime | None = None) -> None:
                 "next_best_exit_price_after_target", "next_best_exit_time_after_target",
                 "next_best_exit_from_entry_pct", "next_best_exit_from_target_pct",
                 "next_best_exit_latency_minutes", "next_outcome",
+                "combined_outcome", "recovered_after_stop",
             ]].copy()
 
             _excel_safe_df(mid_next_view).to_excel(writer, sheet_name="MIDDAY_NEXT_SESSION", index=False)
